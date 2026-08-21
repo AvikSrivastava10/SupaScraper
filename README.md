@@ -168,6 +168,45 @@ curl http://localhost:3000/api/status          # poll for the outcome
 
 The trigger returns immediately because a repair takes minutes. Progress appears in `/api/status` and on the dashboard, which refreshes while a run is in flight.
 
+## Reproducing the self-healing demo
+
+The point of the demo is that a layout change breaks extraction, the system notices, repairs itself, and the downstream catalog keeps working under the **same Collector ID**.
+
+Enable automatic repair in `.env`:
+
+```bash
+SUPASCRAPER_AUTO_HEAL=true
+```
+
+Then, with the app running:
+
+```bash
+# 1. Align the target with the layout the collector currently handles.
+npm run layout baseline
+
+# 2. Collect. Expect classification "healthy" and products on the dashboard.
+curl -X POST http://localhost:3000/api/run
+
+# 3. Change prices and stock, keeping the structure valid.
+npm run layout legitimate_change
+curl -X POST http://localhost:3000/api/run
+#    Expect "legitimate_change": new values published, no repair attempted.
+
+# 4. Now change the markup itself.
+npm run layout structural_break
+curl -X POST http://localhost:3000/api/run
+#    Expect "structural_break": extraction fails, the repair runs, and the
+#    rerun of the same collector restores the original data contract.
+```
+
+Poll `/api/status` between steps, or just watch the dashboard, which refreshes while a run is in flight. A repair takes several minutes.
+
+Two things worth understanding before running it:
+
+**A repair binds the collector to the new markup.** After step 4 the collector expects the restructured layout, so returning to `baseline` will break it again and trigger another repair. That is correct behaviour, since real sites do not revert.
+
+**Deploying resets the target's layout.** Scenario state is intentionally ephemeral, so any redeploy returns it to `baseline`. Always run `npm run layout <mode>` after a deploy, and never rely on a previous session's state.
+
 ## Configuration
 
 See [.env.example](./.env.example) for the full list. Nothing secret belongs in the repository.
