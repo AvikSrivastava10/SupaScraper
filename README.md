@@ -51,6 +51,12 @@ packages/shared     Contracts shared by both apps
 fixtures/           Sanitized contract and sample data
 ```
 
+## Live demo target
+
+The controlled catalog is deployed at **https://supascraper-target.onrender.com/catalog**.
+
+It runs on a free instance that idles out after inactivity, so the first request after a quiet period is slow. Warm it before a demo.
+
 ## Prerequisites
 
 - Node.js 22.16 or newer
