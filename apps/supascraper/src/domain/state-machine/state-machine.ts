@@ -5,6 +5,7 @@ export type OrchestrationState =
   | "suspected"
   | "retry_or_wait"
   | "healing"
+  | "awaiting_approval"
   | "verifying"
   | "recovered"
   | "manual_review";
@@ -17,7 +18,8 @@ const ALLOWED_TRANSITIONS: Readonly<
   healthy: ["running", "suspected"],
   suspected: ["healthy", "retry_or_wait", "healing", "manual_review"],
   retry_or_wait: ["running", "manual_review"],
-  healing: ["verifying", "manual_review"],
+  healing: ["awaiting_approval", "manual_review"],
+  awaiting_approval: ["verifying", "manual_review"],
   verifying: ["recovered", "manual_review"],
   recovered: ["healthy", "running"],
   manual_review: ["idle", "running"],
