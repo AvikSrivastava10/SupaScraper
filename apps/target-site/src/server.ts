@@ -6,6 +6,7 @@ import { handleScenarioControl } from "./routes/control-route.js";
 import type { HttpResponse } from "./routes/http-response.js";
 import { jsonResponse } from "./routes/http-response.js";
 import { FileScenarioStore } from "./state/file-scenario-store.js";
+import { RequestLog } from "./state/request-log.js";
 import type { ScenarioStore } from "./state/scenario-store.js";
 
 const MAX_CONTROL_BODY_BYTES = 16 * 1024;
@@ -83,10 +84,35 @@ export function createTargetServer(
   ),
 ) {
   const controlToken = process.env["TARGET_CONTROL_TOKEN"];
+  const requestLog = new RequestLog();
 
   return createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
     const path = normalizePath(url.pathname);
+
+    response.once("finish", () => {
+      if (path === "/__control/requests") {
+        return;
+      }
+      requestLog.record({
+        at: new Date().toISOString(),
+        method: request.method ?? "?",
+        url: request.url ?? "?",
+        status: response.statusCode,
+        userAgent: request.headers["user-agent"] ?? "-",
+        forwardedFor: String(request.headers["x-forwarded-for"] ?? "-"),
+      });
+    });
+
+    if (request.method === "GET" && path === "/__control/requests") {
+      const supplied = request.headers.authorization;
+      if (!controlToken || supplied !== `Bearer ${controlToken}`) {
+        writeResponse(response, jsonResponse(401, { error: "Unauthorized." }));
+        return;
+      }
+      writeResponse(response, jsonResponse(200, { requests: requestLog.list() }));
+      return;
+    }
 
     if (request.method === "GET" && path === "/health") {
       writeResponse(
