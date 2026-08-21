@@ -132,7 +132,12 @@ export async function processCollectorRun(
     });
 
     repair = await healAndVerify(
-      { config: options.config, decision, healPrompt },
+      {
+        config: options.config,
+        decision,
+        healPrompt,
+        ...(previous === null ? {} : { baseline: previous.records }),
+      },
       options.repair,
     );
   }

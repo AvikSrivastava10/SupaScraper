@@ -137,3 +137,36 @@ describe("classifyRun with a baseline", () => {
     assert.equal(decision.classification, "structural_break");
   });
 });
+
+describe("duplicate product detection", () => {
+  it("rejects a run that returns the same product repeatedly", () => {
+    // Every row is individually valid, and the row count matches the baseline,
+    // so nothing else in the pipeline would catch this.
+    const duplicated = [CATALOG[0], CATALOG[0], CATALOG[0]];
+    const evaluation = evaluateCatalogContract(duplicated);
+
+    assert.equal(evaluation.valid, false);
+    assert.ok(evaluation.violations.some((violation) => violation.code === "sku_duplicated"));
+    assert.equal(evaluation.acceptedRecords.length, 1, "only the first row may be accepted");
+  });
+
+  it("classifies duplicated extraction as a structural break, not a data change", () => {
+    const duplicated = [CATALOG[0], CATALOG[0], CATALOG[0]];
+    const decision = classify(duplicated, CATALOG);
+
+    assert.equal(decision.classification, "structural_break");
+    assert.equal(decision.recommendedAction, "heal");
+  });
+
+  it("treats duplicate SKUs case-insensitively", () => {
+    const mixedCase = [
+      CATALOG[0],
+      { ...CATALOG[0], sku: CATALOG[0].sku.toLowerCase() },
+    ];
+    assert.equal(evaluateCatalogContract(mixedCase).valid, false);
+  });
+
+  it("still accepts a catalog of genuinely distinct products", () => {
+    assert.equal(evaluateCatalogContract(CATALOG).valid, true);
+  });
+});

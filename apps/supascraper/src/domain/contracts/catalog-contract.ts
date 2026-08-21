@@ -89,6 +89,7 @@ export function evaluateCatalogContract(
   const acceptedRecords: CatalogRecord[] = [];
   const missing = emptyFieldCounts();
   const nulls = emptyFieldCounts();
+  const seenSkus = new Set<string>();
 
   if (records.length < contract.minimumRows || records.length > contract.maximumRows) {
     violations.push({
@@ -160,6 +161,22 @@ export function evaluateCatalogContract(
         path: `${path}.availability`,
         message: `availability must be one of: ${AVAILABILITY_VALUES.join(", ")}.`,
       });
+    }
+
+    // A repeated SKU means the extraction matched the same element for several
+    // inputs. Every row can look valid while most of the catalog is lost, so
+    // uniqueness has to be part of the contract rather than an afterthought.
+    if (typeof sku === "string" && sku.trim().length > 0) {
+      const key = sku.trim().toLowerCase();
+      if (seenSkus.has(key)) {
+        rowIsValid = false;
+        violations.push({
+          code: "sku_duplicated",
+          path: `${path}.sku`,
+          message: `sku ${sku} appears more than once, which means extraction matched the same product repeatedly.`,
+        });
+      }
+      seenSkus.add(key);
     }
 
     if (

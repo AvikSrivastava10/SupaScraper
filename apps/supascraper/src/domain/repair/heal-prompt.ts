@@ -24,13 +24,37 @@ function affectedFields(evaluation: ContractEvaluation): CatalogFieldName[] {
   return [...affected];
 }
 
+/** Characters a CSS or XPath selector may contain. */
+const SELECTOR_CHARSET = /^[A-Za-z0-9\s.#\-_[\]="'():>~*+/@|]{1,80}$/;
+
+/** At least one of these must appear, or the value must be a single token. */
+const SELECTOR_SYNTAX = /[.#[\]=:>~*+/@|]/;
+
+/**
+ * Extracts the selector a failing run reported, if it plausibly is one.
+ *
+ * The message originates outside this process, and it is forwarded into a prompt
+ * consumed by Bright Data's AI. It cannot inject a shell command, because
+ * arguments are passed as an array, but unbounded external text should not be
+ * relayed into someone else's model either. Anything that does not look like a
+ * selector is dropped rather than sanitized into something misleading.
+ */
 function firstSelectorHint(run: NormalizedRunResult): string | null {
   for (const error of run.extractionErrors) {
     if (error.kind !== "selector_timeout") continue;
-    // Report the selector the scraper waited for, since that is observed fact.
+
     const quoted = /"([^"]+)"/.exec(error.message);
-    if (quoted?.[1] !== undefined) {
-      return quoted[1];
+    const candidate = quoted?.[1];
+    if (candidate === undefined) continue;
+
+    const collapsed = candidate.replace(/\s+/g, " ").trim();
+    if (!SELECTOR_CHARSET.test(collapsed)) continue;
+
+    // Prose passes a charset check, so require selector syntax or a bare tag.
+    const looksLikeSelector =
+      SELECTOR_SYNTAX.test(collapsed) || !collapsed.includes(" ");
+    if (looksLikeSelector) {
+      return collapsed;
     }
   }
   return null;

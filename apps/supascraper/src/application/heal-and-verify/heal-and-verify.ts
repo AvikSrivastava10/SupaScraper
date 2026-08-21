@@ -1,3 +1,5 @@
+import type { CatalogRecord } from "@supascraper/shared";
+
 import { evaluateCatalogContract } from "../../domain/contracts/catalog-contract.js";
 import type {
   CollectorConfig,
@@ -54,6 +56,32 @@ export interface HealAndVerifyInput {
   readonly config: CollectorConfig;
   readonly decision: DetectionDecision;
   readonly healPrompt: string;
+  /**
+   * Last verified data, used to confirm the repaired scraper still returns the
+   * same products rather than merely returning something contract-shaped.
+   */
+  readonly baseline?: readonly CatalogRecord[];
+}
+
+/**
+ * Fraction of baseline products a repaired run must still return.
+ *
+ * A heal that latched onto the wrong element can satisfy the contract while
+ * losing most of the catalog, so contract validity alone is not enough to call
+ * a repair successful.
+ */
+export const MIN_BASELINE_OVERLAP = 0.5;
+
+export function baselineOverlap(
+  baseline: readonly CatalogRecord[],
+  recovered: readonly CatalogRecord[],
+): number {
+  if (baseline.length === 0) {
+    return 1;
+  }
+  const recoveredSkus = new Set(recovered.map((record) => record.sku));
+  const retained = baseline.filter((record) => recoveredSkus.has(record.sku)).length;
+  return retained / baseline.length;
 }
 
 export type HealAndVerifyStatus =
@@ -189,6 +217,22 @@ export async function healAndVerify(
         reason:
           "Verification run did not satisfy the expected data contract after healing.",
       };
+    }
+
+    // Contract-shaped is not the same as correct. Confirm the repaired scraper
+    // still returns the products it used to.
+    if (input.baseline !== undefined && input.baseline.length > 0) {
+      const overlap = baselineOverlap(input.baseline, evaluation.acceptedRecords);
+      if (overlap < MIN_BASELINE_OVERLAP) {
+        return {
+          status: "manual_review",
+          finalState: transitionState(state, "manual_review"),
+          envelope,
+          review,
+          verificationRun,
+          reason: `Repaired output retained only ${String(Math.round(overlap * 100))}% of previously known products, so it may be extracting the wrong element.`,
+        };
+      }
     }
 
     await dataStore.saveLastKnownGood(
