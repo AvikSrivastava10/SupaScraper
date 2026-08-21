@@ -17,6 +17,8 @@ Built for the WeMakeDevs "Into the Scrape-Verse" hackathon (17–23 August 2026)
 | Bright Data CLI capability audit | Verified against CLI `0.3.5` |
 | Controlled target site with switchable failure scenarios | Implemented, durable across restarts |
 | Public deployment of the target | Configuration ready, not yet deployed |
+| Scrapes a real site we do not control | Verified; 11 books from books.toscrape.com |
+| Monitors several sites at once | Verified; per-target history, guards, and dashboard |
 | Break, heal, approve, recover against a live collector | Verified end to end; recovered data byte-identical to baseline |
 | Collector integration inside the app | Adapter deliberately fails closed; not wired into the running server yet |
 | Contract validation and run classification | Implemented and unit-tested |
@@ -58,11 +60,20 @@ packages/shared     Contracts shared by both apps
 fixtures/           Sanitized contract and sample data
 ```
 
-## Live demo target
+## What it monitors
 
-The controlled catalog is deployed at **https://supascraper-target.onrender.com/catalog**.
+Two sites, for two different reasons. Both are defined in [targets.json](./targets.json).
 
-It runs on a free instance that idles out after inactivity, so the first request after a quiet period is slow. Warm it before a demo.
+| Site | Collector | Why |
+|---|---|---|
+| [books.toscrape.com](https://books.toscrape.com/catalogue/category/books/travel_2/index.html) | `c_mt3hxh7g1dg3mosktp` | A real public site we do not control. Proves the pipeline works on the open web. |
+| [supascraper-target.onrender.com](https://supascraper-target.onrender.com/catalog) | `c_mt351xy524myzqlu8x` | A catalog we deployed, whose markup can be changed on command. Proves the repair works on cue. |
+
+The controlled site exists because a demo needs a break you can cause, reverse, and repeat. No third-party site will redesign its markup while you watch. But the detection and repair logic has no idea which is which: it only ever sees collector output.
+
+Both were healed by the system itself. The real site's collector initially omitted `price` and returned unnormalised availability; SupaScraper classified that as a structural break, repaired it, verified the repair, and published eleven books.
+
+The controlled site runs on a free instance that idles out, so warm it before a demo.
 
 ## Prerequisites
 
@@ -150,7 +161,9 @@ node node_modules/@brightdata/cli/dist/index.js scraper create <public-url> \
   "Extract each product's name, SKU, numeric price, and availability." --pretty
 ```
 
-Save the returned `c_*` Collector ID into `.env` as `SUPASCRAPER_COLLECTOR_ID`. **Reuse it** — the whole premise is that a repair keeps the same collector, so the application never creates one on startup.
+Add the returned `c_*` Collector ID to [targets.json](./targets.json), or set `SUPASCRAPER_COLLECTOR_ID` for a single-target setup. **Reuse it** — the whole premise is that a repair keeps the same collector, so the application never creates one on startup.
+
+Each target needs an `id`, a `label`, the `collectorId`, the `targetUrl`, the plain-language `fieldDescription`, and `controllable` set to true only for a site whose markup you can change yourself.
 
 ```bash
 node node_modules/@brightdata/cli/dist/index.js scraper run <collector_id> <url> --pretty
