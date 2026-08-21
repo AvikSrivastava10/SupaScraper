@@ -1,7 +1,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { pathToFileURL } from "node:url";
 
-import { buildCatalogResponse } from "./routes/catalog-route.js";
+import {
+  buildCatalogResponse,
+  buildProductResponse,
+} from "./routes/catalog-route.js";
 import { handleScenarioControl } from "./routes/control-route.js";
 import type { HttpResponse } from "./routes/http-response.js";
 import { jsonResponse } from "./routes/http-response.js";
@@ -124,6 +127,12 @@ export function createTargetServer(
 
     if (request.method === "GET" && CATALOG_PATHS.has(path)) {
       writeResponse(response, buildCatalogResponse(scenarioStore.get()));
+      return;
+    }
+
+    if (request.method === "GET" && path.startsWith("/product/")) {
+      const sku = decodeURIComponent(path.slice("/product/".length));
+      writeResponse(response, buildProductResponse(scenarioStore.get(), sku));
       return;
     }
 
