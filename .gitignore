@@ -1,0 +1,39 @@
+# Project documentation is intentionally local-only
+/Docs/
+
+# Dependencies
+/node_modules/
+**/node_modules/
+
+# Build output
+/dist/
+**/dist/
+*.tsbuildinfo
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+
+# Local state and data
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+/data/
+/tmp/
+
+# Coverage, caches, and logs
+/coverage/
+**/coverage/
+.cache/
+*.log
+npm-debug.log*
+
+# Recorded or generated demo artifacts
+/artifacts/
+/recordings/
+
+# Operating system files
+.DS_Store
+Thumbs.db

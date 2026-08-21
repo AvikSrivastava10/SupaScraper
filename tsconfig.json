@@ -1,0 +1,14 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/shared"
+    },
+    {
+      "path": "./apps/target-site"
+    },
+    {
+      "path": "./apps/supascraper"
+    }
+  ]
+}

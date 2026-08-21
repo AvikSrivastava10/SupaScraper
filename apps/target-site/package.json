@@ -1,0 +1,15 @@
+{
+  "name": "@supascraper/target-site",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/server.js",
+  "scripts": {
+    "build": "tsc -b --pretty false",
+    "typecheck": "tsc -b --pretty false",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@supascraper/shared": "0.1.0"
+  }
+}

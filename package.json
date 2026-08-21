@@ -1,0 +1,25 @@
+{
+  "name": "supascraper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@10.9.2",
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc -b --pretty false",
+    "typecheck": "tsc -b --pretty false",
+    "clean": "tsc -b --clean",
+    "start:target": "npm run start --workspace @supascraper/target-site",
+    "start:app": "npm run start --workspace @supascraper/app"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "typescript": "7.0.2"
+  }
+}
