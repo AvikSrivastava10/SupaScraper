@@ -19,7 +19,7 @@ Built for the WeMakeDevs "Into the Scrape-Verse" hackathon (17–23 August 2026)
 | Public deployment of the target | Configuration ready, not yet deployed |
 | Collector create / run / heal / approve integration | Adapter fails closed pending live verification |
 | Contract validation and run classification | Implemented, not yet independently tested |
-| Automated heal orchestration | Not implemented |
+| Heal → approve → verify orchestration | Flow implemented and gate-enforced; live adapter not wired |
 | Dashboard | Minimal status view only |
 
 The Bright Data adapter intentionally throws rather than pretending to work, so nothing can silently report a fake repair.
@@ -113,11 +113,18 @@ Scenario state persists to disk so it survives across requests, and resets to `b
 
 ## Deploying the target
 
-Bright Data scrapes from its cloud, so the target needs a public HTTPS URL. A `Dockerfile` and a Render Blueprint are included, and the image is deliberately host-portable.
+Bright Data scrapes from its cloud, so the target needs a public HTTPS URL.
 
-Using Render: connect the repository as a Blueprint, and `render.yaml` provisions a free web service with a generated `TARGET_CONTROL_TOKEN`. Read that token from the Render dashboard to drive scenarios; it is never committed.
+Connect the repository to [Render](https://render.com) as a Blueprint. `render.yaml` provisions a free web service on the native Node runtime and generates `TARGET_CONTROL_TOKEN` for you; read it from the Render dashboard to drive scenarios. It is never committed.
 
-Any host that runs a container works the same way. The service reads `PORT` when the platform injects one, and falls back to `TARGET_SITE_PORT` locally.
+The build and start commands are plain npm:
+
+```bash
+npm ci && npm run build --workspace @supascraper/target-site
+node apps/target-site/dist/server.js
+```
+
+The service reads `PORT` when a platform injects one and falls back to `TARGET_SITE_PORT` locally, so it runs unchanged on any host. A `Dockerfile` is included for portability to a container host, but the native runtime is the supported path.
 
 Scenario state lives on an ephemeral filesystem by design, so a redeploy returns the target to `baseline`.
 
