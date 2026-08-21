@@ -21,8 +21,11 @@ Built for the WeMakeDevs "Into the Scrape-Verse" hackathon (17–23 August 2026)
 | Collector integration inside the app | Adapter deliberately fails closed; not wired into the running server yet |
 | Contract validation and run classification | Implemented and unit-tested |
 | Unattended heal → review → approve → verify | Verified live; a real break repaired itself and rows went 0/0 to 3/3 |
-| Automated test suite | 148 tests, no test framework dependency |
-| Dashboard | Catalog, status, freshness, and repair timeline |
+| Tells a data change from a broken extraction | Verified live; changed prices published without any repair |
+| Gemini second opinion | Implemented and unit-tested; needs `GEMINI_API_KEY` to run live |
+| Scheduled unattended runs | Implemented, opt-in, five-minute floor |
+| Dashboard | Catalog, status, freshness, repair timeline, generated prompt |
+| Automated test suite | 197 tests, no test framework dependency |
 
 Automatic repair is off unless `SUPASCRAPER_AUTO_HEAL=true`, and the repair dependencies are only assembled when it is enabled, so no accidental code path can mutate a hosted collector.
 
@@ -215,10 +218,31 @@ See [.env.example](./.env.example) for the full list. Nothing secret belongs in 
 |---|---|
 | `SUPASCRAPER_COLLECTOR_ID` | Existing `c_*` collector to reuse |
 | `SUPASCRAPER_TARGET_URL` | Public URL to scrape |
+| `SUPASCRAPER_AUTO_HEAL` | Enables unattended repair; off by default |
+| `SUPASCRAPER_SCHEDULE_MINUTES` | Unattended run interval; empty for none, minimum 5 |
+| `SUPASCRAPER_GEMINI_ENABLED` | Enables the second-opinion layer |
+| `SUPASCRAPER_HOST` / `SUPASCRAPER_API_TOKEN` | Loopback by default; a non-loopback bind requires a token |
+| `SUPASCRAPER_DATA_PATH` | Where verified data and repair history persist |
 | `BRIGHTDATA_API_KEY` | Optional; only for non-interactive runs |
 | `GEMINI_API_KEY` | Optional; reasoning layer |
 | `TARGET_CONTROL_TOKEN` | Protects the scenario control route |
 | `TARGET_STATE_PATH` | Where scenario state is persisted |
+
+## How a decision is made
+
+Every run is classified deterministically before anything else happens, in a deliberate order:
+
+| Observation | Classification | What happens |
+|---|---|---|
+| Run failed or timed out, retryable | `transient_error` | Retry later, publish nothing |
+| Page unreachable, e.g. a 404 | `ambiguous` | Manual review; healing a dead page would destroy working logic |
+| Page loaded, a selector no longer matches | `structural_break` | Repair, review the preview, approve, verify |
+| Rows violate the contract, including duplicate SKUs | `structural_break` | As above |
+| Valid rows, values differ from history | `legitimate_change` | Publish; the site changed, the scraper is fine |
+| Valid rows, more than half the catalog gone | `ambiguous` | Manual review; likely partial extraction |
+| Valid rows, unchanged | `healthy` | Publish |
+
+Gemini, when enabled, is consulted only for `ambiguous` and `structural_break` verdicts. It can add evidence and it can downgrade a repair to manual review, but it can never escalate anything into a repair. The deterministic result always sets the ceiling.
 
 ## Scripts
 
@@ -233,6 +257,18 @@ See [.env.example](./.env.example) for the full list. Nothing secret belongs in 
 Tests use Node's built-in runner with no test framework dependency. They run against compiled output, so `npm test` builds first.
 | `npm run start:target` | Run the demo target |
 | `npm run start:app` | Run the SupaScraper app |
+
+## Scheduled runs
+
+Unattended collection is opt-in:
+
+```bash
+SUPASCRAPER_SCHEDULE_MINUTES=30
+```
+
+The interval has a five-minute floor, because each run consumes credit and a schedule keeps going after everyone has stopped watching. Ticks never overlap: if a repair is still in progress when the timer fires, that tick is skipped rather than queued. The schedule calls the same guarded trigger as the HTTP endpoint, so it obeys the same in-flight guard, validation, and publication rules.
+
+To stop it, clear the variable and restart. The startup log states the interval and the implied runs per day so the budget impact is visible rather than assumed.
 
 ## Data and safety
 
