@@ -3,18 +3,28 @@
 # The target must be publicly reachable because Bright Data scrapes it from
 # their cloud. Only this demo target is deployed here; the SupaScraper
 # application itself runs locally for the demo.
+#
+# This uses Render's native Node runtime rather than the Dockerfile. Both build
+# the same thing, but the native path has far less that can go wrong and its
+# build command is verifiable locally. The Dockerfile is retained as a
+# portability fallback for another host.
 
 services:
   - type: web
     name: supascraper-target
-    runtime: docker
-    dockerfilePath: ./Dockerfile
+    runtime: node
     plan: free
+    buildCommand: npm ci && npm run build --workspace @supascraper/target-site
+    startCommand: node apps/target-site/dist/server.js
     healthCheckPath: /health
     envVars:
+      - key: NODE_VERSION
+        value: "22"
       # Render generates this secret; read it from the dashboard to drive
       # scenario changes. It is never stored in the repository.
       - key: TARGET_CONTROL_TOKEN
         generateValue: true
+      # /tmp is writable and intentionally ephemeral: a redeploy returns the
+      # target to baseline, which is the desired pre-demo state.
       - key: TARGET_STATE_PATH
         value: /tmp/target-scenario.json

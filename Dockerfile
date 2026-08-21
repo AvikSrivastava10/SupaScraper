@@ -1,5 +1,13 @@
 # Controlled target site for the SupaScraper self-healing demo.
-# Kept host-portable so the same image runs on Render, Railway, or Fly.io.
+#
+# FALLBACK ONLY. The active deployment uses Render's native Node runtime, see
+# render.yaml. This Dockerfile exists so the target can move to any container
+# host without rework.
+#
+# Note: this image has never been built, because Docker is not installed on the
+# development machine. Its individual assumptions were verified separately
+# (workspace-scoped build, dev-dependency pruning), but the layer sequence is
+# unproven. Build it locally before relying on it.
 
 FROM node:22-alpine AS builder
 WORKDIR /app
