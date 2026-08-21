@@ -638,3 +638,43 @@ describe("configuration safety", () => {
     assert.equal(loadConfig({}).host, "127.0.0.1");
   });
 });
+
+describe("transport failures observed in real runs", () => {
+  it("recognizes the navigation failure Bright Data actually emits", () => {
+    // Observed live on 2026-08-22. A marker list built from assumptions missed
+    // this and fell through to "unknown".
+    assert.equal(
+      classifyExtractionError(
+        "Crawler error: Navigation failed: Network connection was closed by other party.",
+        null,
+      ),
+      "unreachable_page",
+    );
+  });
+
+  it("recognizes the common socket and connection failures", () => {
+    const transport = [
+      "Navigation failed: connection refused",
+      "socket hang up",
+      "ECONNRESET while loading",
+      "ECONNREFUSED 10.0.0.1:443",
+      "connection reset by peer",
+    ];
+    for (const message of transport) {
+      assert.equal(classifyExtractionError(message, null), "unreachable_page", message);
+    }
+  });
+
+  it("still treats a mixed run as structural when a selector genuinely failed", () => {
+    // A run can carry both kinds. Selector evidence proves the page loaded at
+    // least once, so a repair is warranted.
+    const mixed = [
+      classifyExtractionError("Navigation failed: Network connection was closed", null),
+      classifyExtractionError(
+        'waiting for selector ".product-detail" failed: timeout 30000ms exceeded',
+        null,
+      ),
+    ];
+    assert.deepEqual(mixed, ["unreachable_page", "selector_timeout"]);
+  });
+});

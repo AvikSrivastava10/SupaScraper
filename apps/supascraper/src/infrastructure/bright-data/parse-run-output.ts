@@ -26,13 +26,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * page must never trigger a heal, while a selector timeout is exactly what
  * should.
  */
-/** Messages that mean the page itself never loaded usefully. */
+/**
+ * Messages that mean the page itself never loaded usefully.
+ *
+ * Several of these were observed in real runs rather than guessed, including
+ * "Navigation failed: Network connection was closed by other party", which a
+ * marker list built from assumptions would have missed.
+ */
 const UNREACHABLE_MARKERS = [
   "dead page",
   "navigation timeout",
+  "navigation failed",
+  "connection was closed",
+  "connection closed",
+  "connection refused",
+  "connection reset",
+  "socket hang up",
   "net::",
   "err_name_not_resolved",
   "err_connection",
+  "econnreset",
+  "econnrefused",
   "dns",
   "status code",
 ];
