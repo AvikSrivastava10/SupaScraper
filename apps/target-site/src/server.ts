@@ -5,18 +5,29 @@ import { buildCatalogResponse } from "./routes/catalog-route.js";
 import { handleScenarioControl } from "./routes/control-route.js";
 import type { HttpResponse } from "./routes/http-response.js";
 import { jsonResponse } from "./routes/http-response.js";
-import { InMemoryScenarioStore } from "./state/scenario-store.js";
+import { FileScenarioStore } from "./state/file-scenario-store.js";
+import type { ScenarioStore } from "./state/scenario-store.js";
 
 const MAX_CONTROL_BODY_BYTES = 16 * 1024;
 
-function parsePort(value: string | undefined, fallback: number): number {
-  if (value === undefined) {
+/**
+ * Container hosts inject `PORT`, so it takes precedence over the local
+ * `TARGET_SITE_PORT` override.
+ */
+export function resolvePort(
+  environment: NodeJS.ProcessEnv = process.env,
+  fallback = 3001,
+): number {
+  const source = environment["PORT"] ?? environment["TARGET_SITE_PORT"];
+  if (source === undefined || source === "") {
     return fallback;
   }
 
-  const port = Number.parseInt(value, 10);
+  const port = Number.parseInt(source, 10);
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-    throw new Error("TARGET_SITE_PORT must be an integer between 1 and 65535.");
+    throw new Error(
+      "PORT/TARGET_SITE_PORT must be an integer between 1 and 65535.",
+    );
   }
 
   return port;
@@ -49,8 +60,11 @@ function writeResponse(response: ServerResponse, result: HttpResponse): void {
   response.end(result.body);
 }
 
-export function createTargetServer() {
-  const scenarioStore = new InMemoryScenarioStore();
+export function createTargetServer(
+  scenarioStore: ScenarioStore = new FileScenarioStore(
+    process.env["TARGET_STATE_PATH"] ?? "./data/target-scenario.json",
+  ),
+) {
   const controlToken = process.env["TARGET_CONTROL_TOKEN"];
 
   return createServer(async (request, response) => {
@@ -92,7 +106,7 @@ export function createTargetServer() {
 }
 
 function start(): void {
-  const port = parsePort(process.env["TARGET_SITE_PORT"], 3001);
+  const port = resolvePort();
   const server = createTargetServer();
 
   server.listen(port, "0.0.0.0", () => {

@@ -1,0 +1,20 @@
+# Render Blueprint for the SupaScraper controlled target site.
+#
+# The target must be publicly reachable because Bright Data scrapes it from
+# their cloud. Only this demo target is deployed here; the SupaScraper
+# application itself runs locally for the demo.
+
+services:
+  - type: web
+    name: supascraper-target
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      # Render generates this secret; read it from the dashboard to drive
+      # scenario changes. It is never stored in the repository.
+      - key: TARGET_CONTROL_TOKEN
+        generateValue: true
+      - key: TARGET_STATE_PATH
+        value: /tmp/target-scenario.json
