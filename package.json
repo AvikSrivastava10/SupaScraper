@@ -18,8 +18,9 @@
     "pretest": "npm run build",
     "test": "node --experimental-strip-types --test \"apps/*/tests/*.test.ts\"",
     "verify": "npm run build && npm test",
-    "start:target": "npm run start --workspace @supascraper/target-site",
-    "start:app": "npm run start --workspace @supascraper/app"
+    "start:target": "node --env-file-if-exists=.env apps/target-site/dist/server.js",
+    "start:app": "node --env-file-if-exists=.env apps/supascraper/dist/main.js",
+    "layout": "node scripts/set-layout.mjs"
   },
   "devDependencies": {
     "@brightdata/cli": "0.3.5",

@@ -13,7 +13,8 @@ import {
   transitionState,
   type OrchestrationState,
 } from "../dist/domain/state-machine/state-machine.js";
-import { loadConfig } from "../dist/config/config.js";
+import { isLoopbackHost, loadConfig } from "../dist/config/config.js";
+import { parseRunOutput } from "../dist/infrastructure/bright-data/parse-run-output.js";
 import { formatLogLine } from "../dist/infrastructure/logging/logger.js";
 import { InMemoryRepository } from "../dist/infrastructure/persistence/in-memory-repository.js";
 import {
@@ -28,13 +29,17 @@ const VALID_RECORD = {
   availability: "in_stock",
 };
 
-const succeeded = (records: readonly unknown[]): NormalizedRunResult => ({
+const succeeded = (
+  records: readonly unknown[],
+  extractionErrors: NormalizedRunResult["extractionErrors"] = [],
+): NormalizedRunResult => ({
   collectorId: "c_test",
   targetUrl: "https://example.test/catalog",
   startedAt: "2026-08-21T00:00:00Z",
   finishedAt: "2026-08-21T00:00:05Z",
   status: "succeeded",
   records,
+  extractionErrors,
   snapshotId: null,
   safeError: null,
 });
@@ -375,9 +380,39 @@ describe("committed Bright Data fixtures", () => {
     assert.deepEqual(normalize(recovered), normalize(load("collector-baseline.json")));
   });
 
-  it("a real broken run is classified as structural, not transient", () => {
-    const broken = load("collector-structural-break.json");
-    const decision = classifyRun(succeeded(broken), evaluateCatalogContract(broken));
+  it("a real broken run parses into extraction errors and classifies as structural", () => {
+    const parsed = parseRunOutput(
+      readFileSync(
+        new URL("../../../fixtures/samples/collector-structural-break.json", import.meta.url),
+        "utf8",
+      ),
+    );
+    assert.equal(parsed.records.length, 0, "error rows must not be treated as data");
+    assert.equal(parsed.extractionErrors.length, 3);
+    assert.ok(parsed.extractionErrors.every((error) => error.kind === "selector_timeout"));
+
+    const decision = classifyRun(
+      succeeded(parsed.records, parsed.extractionErrors),
+      evaluateCatalogContract(parsed.records),
+    );
     assert.equal(decision.classification, "structural_break");
+    assert.equal(decision.recommendedAction, "heal");
+  });
+
+  it("a real successful run parses cleanly with no extraction errors", () => {
+    const parsed = parseRunOutput(
+      readFileSync(
+        new URL("../../../fixtures/samples/collector-baseline.json", import.meta.url),
+        "utf8",
+      ),
+    );
+    assert.equal(parsed.extractionErrors.length, 0);
+    assert.equal(parsed.records.length, 3);
+    const decision = classifyRun(
+      succeeded(parsed.records),
+      evaluateCatalogContract(parsed.records),
+    );
+    assert.equal(decision.classification, "healthy");
+    assert.equal(decision.recommendedAction, "publish");
   });
 });

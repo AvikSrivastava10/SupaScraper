@@ -43,6 +43,7 @@ const run = (
   finishedAt: "2026-08-21T00:00:05Z",
   status: "succeeded",
   records,
+  extractionErrors: [],
   snapshotId: null,
   safeError: null,
   ...overrides,

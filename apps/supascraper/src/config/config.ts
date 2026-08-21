@@ -1,9 +1,18 @@
 import type { CollectorConfig } from "../domain/contracts/collector-run.js";
 
 export interface AppConfig {
+  readonly host: string;
   readonly port: number;
+  readonly dataPath: string;
   readonly geminiEnabled: boolean;
+  readonly apiToken: string | null;
   readonly collector: CollectorConfig | null;
+}
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+
+export function isLoopbackHost(host: string): boolean {
+  return LOOPBACK_HOSTS.has(host);
 }
 
 function parsePositiveInteger(
@@ -60,9 +69,11 @@ function loadCollectorConfig(environment: NodeJS.ProcessEnv): CollectorConfig | 
     fieldDescription:
       environment["SUPASCRAPER_FIELD_DESCRIPTION"] ??
       "Extract product name, SKU, numeric price, and availability.",
+    // Observed live: a run polls for anywhere from seconds to a few minutes.
+    // Two minutes was too tight and produced spurious timeouts.
     timeoutMs: parsePositiveInteger(
       environment["SUPASCRAPER_RUN_TIMEOUT_MS"],
-      120_000,
+      420_000,
       "SUPASCRAPER_RUN_TIMEOUT_MS",
     ),
   };
@@ -80,9 +91,23 @@ export function loadConfig(
     throw new Error("SUPASCRAPER_PORT must not exceed 65535.");
   }
 
+  // Loopback by default: the run endpoint spends Bright Data credit, so it must
+  // not be exposed to the network unless that is an explicit choice.
+  const host = environment["SUPASCRAPER_HOST"] ?? "127.0.0.1";
+  const apiToken = environment["SUPASCRAPER_API_TOKEN"] ?? null;
+
+  if (!isLoopbackHost(host) && (apiToken === null || apiToken.length < 16)) {
+    throw new Error(
+      "Binding SUPASCRAPER_HOST to a non-loopback address requires SUPASCRAPER_API_TOKEN of at least 16 characters, because the run endpoint consumes Bright Data credit.",
+    );
+  }
+
   return {
+    host,
     port,
+    dataPath: environment["SUPASCRAPER_DATA_PATH"] ?? "./data/supascraper-state.json",
     geminiEnabled: parseBoolean(environment["SUPASCRAPER_GEMINI_ENABLED"]),
+    apiToken,
     collector: loadCollectorConfig(environment),
   };
 }
