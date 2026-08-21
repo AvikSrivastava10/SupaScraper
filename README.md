@@ -124,7 +124,7 @@ npm ci && npm run build --workspace @supascraper/target-site
 node apps/target-site/dist/server.js
 ```
 
-The service reads `PORT` when a platform injects one and falls back to `TARGET_SITE_PORT` locally, so it runs unchanged on any host. A `Dockerfile` is included for portability to a container host, but the native runtime is the supported path.
+The service reads `PORT` when a platform injects one and falls back to `TARGET_SITE_PORT` locally, so it runs unchanged on any host that can run Node.
 
 Scenario state lives on an ephemeral filesystem by design, so a redeploy returns the target to `baseline`.
 
