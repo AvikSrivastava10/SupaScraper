@@ -60,6 +60,23 @@ function writeResponse(response: ServerResponse, result: HttpResponse): void {
   response.end(result.body);
 }
 
+/**
+ * Collapses duplicate and trailing slashes so `/catalog`, `/catalog/`, and
+ * `/catalog//` resolve identically.
+ *
+ * Bright Data's browser normalized the target URL to a trailing-slash form and
+ * received a 404, which surfaced as a `dead_page` error rather than as an
+ * extraction failure. Strict path matching is unrealistic for a public site and
+ * would have masked the real demo.
+ */
+export function normalizePath(pathname: string): string {
+  const collapsed = pathname.replace(/\/{2,}/g, "/");
+  return collapsed.length > 1 ? collapsed.replace(/\/+$/, "") : collapsed;
+}
+
+/** A real supplier catalog serves its landing page, so the root is included. */
+const CATALOG_PATHS = new Set(["/", "/catalog"]);
+
 export function createTargetServer(
   scenarioStore: ScenarioStore = new FileScenarioStore(
     process.env["TARGET_STATE_PATH"] ?? "./data/target-scenario.json",
@@ -69,8 +86,9 @@ export function createTargetServer(
 
   return createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://localhost");
+    const path = normalizePath(url.pathname);
 
-    if (request.method === "GET" && url.pathname === "/health") {
+    if (request.method === "GET" && path === "/health") {
       writeResponse(
         response,
         jsonResponse(200, { status: "ok", mode: scenarioStore.get() }),
@@ -78,12 +96,12 @@ export function createTargetServer(
       return;
     }
 
-    if (request.method === "GET" && url.pathname === "/catalog") {
+    if (request.method === "GET" && CATALOG_PATHS.has(path)) {
       writeResponse(response, buildCatalogResponse(scenarioStore.get()));
       return;
     }
 
-    if (request.method === "POST" && url.pathname === "/__control/scenario") {
+    if (request.method === "POST" && path === "/__control/scenario") {
       try {
         const body = await readJsonBody(request);
         writeResponse(
