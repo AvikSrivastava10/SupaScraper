@@ -4,12 +4,17 @@ import {
   ContractPreviewReviewer,
   type HealAndVerifyDependencies,
 } from "./application/heal-and-verify/heal-and-verify.js";
+import { startScheduler, type SchedulerHandle } from "./application/schedule/scheduler.js";
 import { isLoopbackHost, loadConfig } from "./config/config.js";
+import { UnconfiguredBrightDataAdapter } from "./infrastructure/bright-data/bright-data-adapter.js";
 import {
   BrightDataCliAdapter,
   ProcessCliRunner,
 } from "./infrastructure/bright-data/cli-adapter.js";
-import { UnconfiguredBrightDataAdapter } from "./infrastructure/bright-data/bright-data-adapter.js";
+import {
+  HttpGeminiReasoner,
+  type GeminiReasoner,
+} from "./infrastructure/gemini/gemini-adapter.js";
 import { ConsoleLogger } from "./infrastructure/logging/logger.js";
 import { JsonFileRepository } from "./infrastructure/persistence/json-file-repository.js";
 import { createApplicationServer } from "./presentation/api/server.js";
@@ -39,20 +44,35 @@ export function startApplication(): void {
         }
       : undefined;
 
-  const server = createApplicationServer(config, {
+  // Gemini is optional in the strongest sense: absent configuration simply
+  // means the deterministic detector is the only voice.
+  let reasoner: GeminiReasoner | undefined;
+  if (config.geminiEnabled) {
+    const apiKey = process.env["GEMINI_API_KEY"];
+    if (apiKey === undefined || apiKey.trim().length === 0) {
+      logger.info("Gemini is enabled but no API key is set; continuing without it.");
+    } else {
+      reasoner = new HttpGeminiReasoner({ apiKey }, logger);
+    }
+  }
+
+  const app = createApplicationServer(config, {
     repository,
     runner: adapter,
     logger,
     ...(repair === undefined ? {} : { repair }),
+    ...(reasoner === undefined ? {} : { reasoner }),
   });
 
-  server.listen(config.port, config.host, () => {
+  let scheduler: SchedulerHandle | null = null;
+
+  app.listen(config.port, config.host, () => {
     logger.info("SupaScraper is listening.", {
       host: config.host,
       port: config.port,
       collectorConfigured: config.collector !== null,
-      geminiEnabled: config.geminiEnabled,
       autoHealEnabled: repair !== undefined,
+      geminiEnabled: reasoner !== undefined,
       runEndpointProtected: config.apiToken !== null,
     });
 
@@ -69,10 +89,21 @@ export function startApplication(): void {
         { host: config.host },
       );
     }
+
+    // The schedule reuses the server's guarded trigger, so unattended runs obey
+    // the same in-flight guard and publication rules as a manual one.
+    if (config.scheduleIntervalMs !== null && config.collector !== null) {
+      scheduler = startScheduler({
+        intervalMs: config.scheduleIntervalMs,
+        trigger: () => app.triggerRun(),
+        logger,
+      });
+    }
   });
 
   const shutdown = () => {
-    server.close(() => {
+    scheduler?.stop();
+    app.close(() => {
       process.exit(0);
     });
   };

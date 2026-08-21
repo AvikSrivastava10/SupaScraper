@@ -7,6 +7,8 @@ export interface AppConfig {
   readonly geminiEnabled: boolean;
   /** Off unless explicitly enabled: healing mutates a hosted collector. */
   readonly autoHealEnabled: boolean;
+  /** Null means no unattended runs. */
+  readonly scheduleIntervalMs: number | null;
   readonly apiToken: string | null;
   readonly collector: CollectorConfig | null;
 }
@@ -98,6 +100,23 @@ export function loadConfig(
   const host = environment["SUPASCRAPER_HOST"] ?? "127.0.0.1";
   const apiToken = environment["SUPASCRAPER_API_TOKEN"] ?? null;
 
+  // Absent means no schedule. Unattended runs are opt-in.
+  const rawInterval = environment["SUPASCRAPER_SCHEDULE_MINUTES"];
+  let scheduleIntervalMs: number | null = null;
+  if (rawInterval !== undefined && rawInterval !== "" && rawInterval !== "0") {
+    const minutes = parsePositiveInteger(
+      rawInterval,
+      0,
+      "SUPASCRAPER_SCHEDULE_MINUTES",
+    );
+    if (minutes < 5) {
+      throw new Error(
+        "SUPASCRAPER_SCHEDULE_MINUTES must be at least 5, because every scheduled run consumes Bright Data credit.",
+      );
+    }
+    scheduleIntervalMs = minutes * 60_000;
+  }
+
   if (!isLoopbackHost(host) && (apiToken === null || apiToken.length < 16)) {
     throw new Error(
       "Binding SUPASCRAPER_HOST to a non-loopback address requires SUPASCRAPER_API_TOKEN of at least 16 characters, because the run endpoint consumes Bright Data credit.",
@@ -116,6 +135,7 @@ export function loadConfig(
       environment["SUPASCRAPER_AUTO_HEAL"],
       "SUPASCRAPER_AUTO_HEAL",
     ),
+    scheduleIntervalMs,
     apiToken,
     collector: loadCollectorConfig(environment),
   };

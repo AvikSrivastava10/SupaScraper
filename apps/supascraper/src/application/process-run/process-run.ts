@@ -15,6 +15,8 @@ import {
   type DetectionDecision,
 } from "../../domain/detection/classify-run.js";
 import { buildHealPrompt } from "../../domain/repair/heal-prompt.js";
+import type { GeminiReasoner } from "../../infrastructure/gemini/gemini-adapter.js";
+import { mergeReasoning } from "../../infrastructure/gemini/gemini-adapter.js";
 import type { RepairEvent, VerificationStatus } from "../../domain/repair/repair-event.js";
 import type { OrchestrationState } from "../../domain/state-machine/state-machine.js";
 import type {
@@ -59,6 +61,21 @@ export interface ProcessRunOptions {
   readonly autoHealEnabled?: boolean;
   readonly config?: CollectorConfig;
   readonly repair?: HealAndVerifyDependencies;
+  /** Optional second opinion. Never required, never able to widen permission. */
+  readonly reasoner?: GeminiReasoner;
+}
+
+/**
+ * Gemini is consulted only where a second opinion could change what happens.
+ *
+ * A routine healthy run needs no judgement, and spending quota on non-decisions
+ * would be waste.
+ */
+export function shouldConsultReasoner(decision: DetectionDecision): boolean {
+  return (
+    decision.classification === "ambiguous" ||
+    decision.classification === "structural_break"
+  );
 }
 
 function stateFor(
@@ -100,7 +117,18 @@ export async function processCollectorRun(
   // The previously verified data is the only reference that can distinguish a
   // real data change from a partially broken extraction.
   const previous = await dataStore.getLastKnownGood(run.collectorId);
-  const decision = classifyRun(run, evaluation, previous?.records ?? null);
+  const deterministic = classifyRun(run, evaluation, previous?.records ?? null);
+
+  let decision = deterministic;
+  if (options.reasoner !== undefined && shouldConsultReasoner(deterministic)) {
+    const opinion = await options.reasoner.reason({
+      fieldDescription: options.config?.fieldDescription ?? "",
+      run,
+      evaluation,
+      deterministic,
+    });
+    decision = mergeReasoning(deterministic, opinion);
+  }
 
   const publishable =
     decision.recommendedAction === "publish" && evaluation.valid && run.records.length > 0;

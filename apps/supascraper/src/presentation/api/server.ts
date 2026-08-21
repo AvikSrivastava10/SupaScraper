@@ -10,6 +10,7 @@ import type {
   RepairEventStore,
 } from "../../application/process-run/process-run.js";
 import type { HealAndVerifyDependencies } from "../../application/heal-and-verify/heal-and-verify.js";
+import type { GeminiReasoner } from "../../infrastructure/gemini/gemini-adapter.js";
 import type { Logger } from "../../infrastructure/logging/logger.js";
 import type { DashboardDataReader } from "../../infrastructure/persistence/in-memory-repository.js";
 import { renderDashboardPage, type DashboardStatus } from "../web/dashboard-page.js";
@@ -20,6 +21,8 @@ export interface ApplicationDependencies {
   readonly logger: Logger;
   /** Supplied only when automatic repair is enabled. */
   readonly repair?: HealAndVerifyDependencies;
+  /** Supplied only when Gemini is enabled and configured. */
+  readonly reasoner?: GeminiReasoner;
 }
 
 function writeJson(response: ServerResponse, statusCode: number, value: unknown): void {
@@ -82,11 +85,22 @@ async function buildStatus(
   };
 }
 
+export interface ApplicationServer {
+  readonly server: ReturnType<typeof createServer>;
+  /**
+   * Runs one collection through the same guarded path as the HTTP trigger.
+   *
+   * The scheduler uses this rather than a parallel implementation, so the
+   * in-flight guard, validation, and publication rules cannot diverge.
+   */
+  triggerRun(): Promise<void>;
+}
+
 export function createApplicationServer(
   config: AppConfig,
   dependencies: ApplicationDependencies,
 ) {
-  const { repository, runner, logger, repair } = dependencies;
+  const { repository, runner, logger, repair, reasoner } = dependencies;
 
   // A run that triggers a repair takes many minutes, so the request must not be
   // held open for it. The trigger is accepted and the outcome is observed
@@ -94,36 +108,21 @@ export function createApplicationServer(
   let activeRun: Promise<void> | null = null;
   let lastRunError: string | null = null;
 
-  const handleRun = async (
-    request: IncomingMessage,
-    response: ServerResponse,
-  ): Promise<void> => {
-    if (config.apiToken !== null && !tokenAccepted(request.headers.authorization, config.apiToken)) {
-      writeJson(response, 401, { error: "Unauthorized." });
-      return;
-    }
-
-    if (!config.collector) {
-      writeJson(response, 409, { error: "No collector is configured." });
-      return;
-    }
-
-    // A run costs credit; overlapping triggers would double the spend and
-    // confuse the recorded history.
-    if (activeRun !== null) {
-      writeJson(response, 409, { error: "A run is already in progress." });
-      return;
-    }
-
+  /** Returns false when a run was already in flight, so nothing was started. */
+  const beginRun = (): boolean => {
     const collector = config.collector;
-    lastRunError = null;
+    if (collector === null || activeRun !== null) {
+      return false;
+    }
 
+    lastRunError = null;
     activeRun = (async () => {
       const run = await runCollector(collector, runner);
       await processCollectorRun(run, repository, repository, {
         autoHealEnabled: config.autoHealEnabled && repair !== undefined,
         config: collector,
         ...(repair === undefined ? {} : { repair }),
+        ...(reasoner === undefined ? {} : { reasoner }),
       });
     })()
       .catch((error: unknown) => {
@@ -138,6 +137,27 @@ export function createApplicationServer(
         activeRun = null;
       });
 
+    return true;
+  };
+
+  const handleRun = (request: IncomingMessage, response: ServerResponse): void => {
+    if (config.apiToken !== null && !tokenAccepted(request.headers.authorization, config.apiToken)) {
+      writeJson(response, 401, { error: "Unauthorized." });
+      return;
+    }
+
+    if (!config.collector) {
+      writeJson(response, 409, { error: "No collector is configured." });
+      return;
+    }
+
+    // A run costs credit; overlapping triggers would double the spend and
+    // confuse the recorded history.
+    if (!beginRun()) {
+      writeJson(response, 409, { error: "A run is already in progress." });
+      return;
+    }
+
     writeJson(response, 202, {
       accepted: true,
       autoHealEnabled: config.autoHealEnabled && repair !== undefined,
@@ -145,7 +165,7 @@ export function createApplicationServer(
     });
   };
 
-  return createServer((request, response) => {
+  const server = createServer((request, response) => {
     void (async () => {
       let pathname: string;
       try {
@@ -180,7 +200,7 @@ export function createApplicationServer(
         // The endpoint takes no input. Discard any body so the socket is not
         // left waiting on unread data.
         request.resume();
-        await handleRun(request, response);
+        handleRun(request, response);
         return;
       }
 
@@ -207,4 +227,14 @@ export function createApplicationServer(
       }
     });
   });
+
+  const triggerRun = async (): Promise<void> => {
+    if (!beginRun()) {
+      logger.info("Scheduled run skipped: a run is already in progress.");
+      return;
+    }
+    await activeRun;
+  };
+
+  return Object.assign(server, { triggerRun });
 }
