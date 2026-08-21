@@ -44,21 +44,49 @@ export class JsonFileRepository
     this.#state = this.#read();
   }
 
+  /**
+   * Validates each snapshot rather than trusting the file.
+   *
+   * A file that is valid JSON but the wrong shape would otherwise pass straight
+   * through and throw later while rendering, turning bad state into a crash far
+   * from its cause.
+   */
   #read(): PersistedState {
     try {
       const parsed = JSON.parse(readFileSync(this.#filePath, "utf8")) as unknown;
-      if (typeof parsed !== "object" || parsed === null) {
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
         return { ...EMPTY };
       }
-      const candidate = parsed as Partial<PersistedState>;
-      return {
-        version: 1,
-        catalog:
-          typeof candidate.catalog === "object" && candidate.catalog !== null
-            ? candidate.catalog
-            : {},
-        events: Array.isArray(candidate.events) ? candidate.events : [],
-      };
+
+      const candidate = parsed as Record<string, unknown>;
+      const rawCatalog = candidate["catalog"];
+      const catalog: Record<string, StoredCatalogSnapshot> = {};
+
+      if (typeof rawCatalog === "object" && rawCatalog !== null && !Array.isArray(rawCatalog)) {
+        for (const [key, value] of Object.entries(rawCatalog as Record<string, unknown>)) {
+          if (typeof value !== "object" || value === null) continue;
+          const snapshot = value as Record<string, unknown>;
+          if (!Array.isArray(snapshot["records"])) continue;
+          if (typeof snapshot["collectedAt"] !== "string") continue;
+          catalog[key] = {
+            collectorId: key,
+            records: snapshot["records"] as StoredCatalogSnapshot["records"],
+            collectedAt: snapshot["collectedAt"],
+          };
+        }
+      }
+
+      const rawEvents = candidate["events"];
+      const events = Array.isArray(rawEvents)
+        ? rawEvents.filter(
+            (event): event is RepairEvent =>
+              typeof event === "object" &&
+              event !== null &&
+              typeof (event as Record<string, unknown>)["collectorId"] === "string",
+          )
+        : [];
+
+      return { version: 1, catalog, events };
     } catch {
       // Missing or corrupt state must not prevent the app from starting.
       return { ...EMPTY };

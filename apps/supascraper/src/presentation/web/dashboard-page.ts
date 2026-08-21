@@ -40,6 +40,27 @@ function relativeAge(timestamp: string | null): string {
   return `${String(Math.round(seconds / 86_400))}d ago`;
 }
 
+/** States in which the displayed data is current rather than withheld. */
+const CURRENT_DATA_STATES = new Set<OrchestrationState>([
+  "healthy",
+  "recovered",
+  "idle",
+  "running",
+]);
+
+/**
+ * True when rows are on screen but the most recent run was not published.
+ *
+ * Showing last known good data is the correct behaviour; presenting it as
+ * current is not. Every non-publishing state must say so.
+ */
+export function isShowingStaleData(
+  state: OrchestrationState,
+  hasRecords: boolean,
+): boolean {
+  return hasRecords && !CURRENT_DATA_STATES.has(state);
+}
+
 /** Text label plus tone, so status is never conveyed by colour alone. */
 function describeState(state: OrchestrationState): { label: string; tone: string } {
   switch (state) {
@@ -101,7 +122,7 @@ function renderTimeline(events: readonly RepairEvent[]): string {
 
 export function renderDashboardPage(status: DashboardStatus): string {
   const state = describeState(status.state);
-  const stale = status.records.length > 0 && status.state === "manual_review";
+  const stale = isShowingStaleData(status.state, status.records.length > 0);
 
   return `<!doctype html>
 <html lang="en">
@@ -164,7 +185,7 @@ export function renderDashboardPage(status: DashboardStatus): string {
             <div class="value">${String(status.records.length)}</div>
           </div>
         </div>
-        ${stale ? `<p class="notice" style="margin-top:1rem">Showing the last verified data. A repair is awaiting review, so newer output has not been published.</p>` : ""}
+        ${stale ? `<p class="notice" style="margin-top:1rem">Showing the last verified data. The most recent run did not satisfy the expected contract, so its output was withheld.</p>` : ""}
         ${status.configured ? "" : `<p class="notice" style="margin-top:1rem">No collector configured. Set SUPASCRAPER_COLLECTOR_ID and SUPASCRAPER_TARGET_URL.</p>`}
       </section>
 

@@ -26,18 +26,40 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * page must never trigger a heal, while a selector timeout is exactly what
  * should.
  */
+/** Messages that mean the page itself never loaded usefully. */
+const UNREACHABLE_MARKERS = [
+  "dead page",
+  "navigation timeout",
+  "net::",
+  "err_name_not_resolved",
+  "err_connection",
+  "dns",
+  "status code",
+];
+
 export function classifyExtractionError(
   message: string,
   code: string | null,
 ): ExtractionErrorKind {
   const normalized = message.toLowerCase();
 
-  if (code === "dead_page" || normalized.includes("dead page")) {
+  if (code === "dead_page" || UNREACHABLE_MARKERS.some((marker) => normalized.includes(marker))) {
     return "unreachable_page";
   }
-  if (normalized.includes("waiting for selector") || normalized.includes("timeout")) {
+
+  // Only a failure that names a selector proves the page loaded but the
+  // extraction no longer matches it. A bare "timeout" is ambiguous and could be
+  // a navigation failure, which must never be healed: rewriting extraction
+  // against a page that never loaded would destroy working logic.
+  const namesSelector =
+    normalized.includes("selector") ||
+    normalized.includes("xpath") ||
+    normalized.includes("waiting for element");
+
+  if (namesSelector) {
     return "selector_timeout";
   }
+
   return "unknown";
 }
 

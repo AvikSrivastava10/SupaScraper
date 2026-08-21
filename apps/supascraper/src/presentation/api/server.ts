@@ -152,6 +152,9 @@ export function createApplicationServer(
       }
 
       if (request.method === "POST" && pathname === "/api/run") {
+        // The endpoint takes no input. Discard any body so the socket is not
+        // left waiting on unread data.
+        request.resume();
         await handleRun(request, response);
         return;
       }

@@ -20,7 +20,10 @@ import {
 } from "../dist/infrastructure/bright-data/parse-run-output.js";
 import { JsonFileRepository } from "../dist/infrastructure/persistence/json-file-repository.js";
 import { createApplicationServer } from "../dist/presentation/api/server.js";
-import { renderDashboardPage } from "../dist/presentation/web/dashboard-page.js";
+import {
+  isShowingStaleData,
+  renderDashboardPage,
+} from "../dist/presentation/web/dashboard-page.js";
 import { loadConfig } from "../dist/config/config.js";
 import { ConsoleLogger } from "../dist/infrastructure/logging/logger.js";
 import type { CollectorConfig, NormalizedRunResult } from "../dist/domain/contracts/collector-run.js";
@@ -121,6 +124,38 @@ describe("classifyExtractionError", () => {
       "selector_timeout",
     );
     assert.equal(classifyExtractionError("something odd happened", null), "unknown");
+  });
+
+  it("never treats a page-load failure as a selector problem", () => {
+    // Healing one of these would rewrite working extraction against a page that
+    // never loaded, so none may be classified as a structural break.
+    const pageFailures = [
+      "Navigation timeout of 30000 ms exceeded",
+      "net::ERR_CONNECTION_REFUSED",
+      "net::ERR_NAME_NOT_RESOLVED at https://example.test",
+      "The navigation resulted in a dead page (404 status code)",
+      "DNS lookup failed",
+    ];
+    for (const message of pageFailures) {
+      assert.notEqual(
+        classifyExtractionError(message, null),
+        "selector_timeout",
+        message,
+      );
+    }
+  });
+
+  it("treats an unqualified timeout as unknown rather than structural", () => {
+    assert.equal(classifyExtractionError("operation timed out", null), "unknown");
+    assert.equal(classifyExtractionError("timeout 30000ms exceeded", null), "unknown");
+  });
+
+  it("recognizes xpath and element waits as selector failures", () => {
+    assert.equal(
+      classifyExtractionError("waiting for element .price failed", null),
+      "selector_timeout",
+    );
+    assert.equal(classifyExtractionError("xpath //div[@id] not found", null), "selector_timeout");
   });
 });
 
@@ -276,6 +311,26 @@ describe("JsonFileRepository", () => {
     assert.equal(await repository.getLastKnownGood("c_test"), null);
   });
 
+  it("rejects state that is valid JSON but the wrong shape", async () => {
+    const { writeFileSync } = await import("node:fs");
+    const shapes = [
+      JSON.stringify([1, 2, 3]),
+      JSON.stringify({ catalog: "nope", events: "nope" }),
+      JSON.stringify({ catalog: { c_test: { records: "not-an-array", collectedAt: "x" } } }),
+      JSON.stringify({ catalog: { c_test: { records: [] } } }),
+      JSON.stringify({ events: [null, 5, { noCollectorId: true }] }),
+    ];
+
+    for (const [index, contents] of shapes.entries()) {
+      const path = join(directory, `shape-${String(index)}.json`);
+      writeFileSync(path, contents, "utf8");
+      const repository = new JsonFileRepository(path);
+      // Must not throw here, which is where a bad shape used to surface.
+      assert.equal(await repository.getLastKnownGood("c_test"), null, contents);
+      assert.deepEqual(await repository.listEvents("c_test"), []);
+    }
+  });
+
   it("keeps locks in memory so a stale lock cannot outlive the process", async () => {
     const path = join(directory, "locks.json");
     const first = new JsonFileRepository(path);
@@ -334,9 +389,36 @@ describe("dashboard rendering", () => {
     }
   });
 
-  it("flags stale data when a repair is awaiting review", () => {
-    const html = renderDashboardPage({ ...base, state: "manual_review" });
-    assert.match(html, /last verified data/i);
+  it("flags stale data in every state that withholds an update", () => {
+    // Showing last known good data is correct; implying it is current is not.
+    const withholding = [
+      "suspected",
+      "retry_or_wait",
+      "healing",
+      "awaiting_approval",
+      "verifying",
+      "manual_review",
+    ] as const;
+
+    for (const state of withholding) {
+      assert.equal(isShowingStaleData(state, true), true, state);
+      assert.match(renderDashboardPage({ ...base, state }), /output was withheld/i, state);
+    }
+  });
+
+  it("does not claim data is stale when it is current", () => {
+    for (const state of ["healthy", "recovered", "idle", "running"] as const) {
+      assert.equal(isShowingStaleData(state, true), false, state);
+      assert.doesNotMatch(
+        renderDashboardPage({ ...base, state }),
+        /output was withheld/i,
+        state,
+      );
+    }
+  });
+
+  it("does not flag staleness when there is no data to be stale", () => {
+    assert.equal(isShowingStaleData("manual_review", false), false);
   });
 
   it("handles the empty and unconfigured cases", () => {

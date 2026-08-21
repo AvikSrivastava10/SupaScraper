@@ -55,10 +55,24 @@ export class ProcessCliRunner implements CliRunner {
       let stderr = "";
       let timedOut = false;
 
+      let killTimer: NodeJS.Timeout | undefined;
       const timer = setTimeout(() => {
         timedOut = true;
         child.kill("SIGTERM");
+        // Escalate if the child ignores the polite signal, so a wedged process
+        // cannot make the timeout meaningless.
+        killTimer = setTimeout(() => {
+          child.kill("SIGKILL");
+        }, 5000);
+        killTimer.unref();
       }, invocation.timeoutMs);
+
+      const clearTimers = (): void => {
+        clearTimeout(timer);
+        if (killTimer !== undefined) {
+          clearTimeout(killTimer);
+        }
+      };
 
       const append = (current: string, chunk: Buffer): string =>
         current.length >= MAX_CAPTURED_BYTES
@@ -73,12 +87,12 @@ export class ProcessCliRunner implements CliRunner {
       });
 
       child.once("error", (error) => {
-        clearTimeout(timer);
+        clearTimers();
         reject(error);
       });
 
       child.once("close", (code) => {
-        clearTimeout(timer);
+        clearTimers();
         resolve({ code, stdout, stderr, timedOut });
       });
     });
@@ -98,9 +112,9 @@ export interface BrightDataCliOptions {
  */
 export function sanitizeCliText(value: string, maxLength = 600): string {
   const cleaned = value
-    // eslint-disable-next-line no-control-regex -- stripping ANSI escapes
+    // ANSI escape sequences, then Braille-range spinner frames the CLI emits.
     .replace(/\u001B\[[0-9;]*[A-Za-z]/g, "")
-    .replace(/[\u2800-\u28FF\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F]/g, "")
+    .replace(/[\u2800-\u28FF]/g, "")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
