@@ -206,7 +206,12 @@ export async function healAndVerify(
       reason: "Same collector recovered the original data contract.",
     };
   } finally {
-    await lock.release(input.config.collectorId, lockToken);
+    // A throw from release inside `finally` would replace the original error
+    // and hide the real cause, so it is swallowed deliberately. Losing the
+    // lock is recoverable; losing the diagnosis is not.
+    await lock
+      .release(input.config.collectorId, lockToken)
+      .catch(() => undefined);
   }
 }
 

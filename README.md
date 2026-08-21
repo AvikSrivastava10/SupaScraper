@@ -17,10 +17,14 @@ Built for the WeMakeDevs "Into the Scrape-Verse" hackathon (17–23 August 2026)
 | Bright Data CLI capability audit | Verified against CLI `0.3.5` |
 | Controlled target site with switchable failure scenarios | Implemented, durable across restarts |
 | Public deployment of the target | Configuration ready, not yet deployed |
-| Collector create / run / heal / approve integration | Adapter fails closed pending live verification |
-| Contract validation and run classification | Implemented, not yet independently tested |
-| Heal → approve → verify orchestration | Flow implemented and gate-enforced; live adapter not wired |
+| Break, heal, approve, recover against a live collector | Verified end to end; recovered data byte-identical to baseline |
+| Collector integration inside the app | Adapter deliberately fails closed; not wired into the running server yet |
+| Contract validation and run classification | Implemented and unit-tested |
+| Heal → approve → verify orchestration | Implemented, gate-enforced, unit-tested; not wired into the running server yet |
+| Automated test suite | 90 tests, no external dependencies |
 | Dashboard | Minimal status view only |
+
+The orchestration logic is exercised by tests rather than by the running server: `main.ts` currently serves health, status, and the dashboard, and does not trigger collector runs. Wiring that up is the next phase.
 
 The Bright Data adapter intentionally throws rather than pretending to work, so nothing can silently report a fake repair.
 
@@ -171,8 +175,12 @@ See [.env.example](./.env.example) for the full list. Nothing secret belongs in 
 | Command | Description |
 |---|---|
 | `npm run build` | Build all workspaces |
+| `npm test` | Build, then run the test suite |
+| `npm run verify` | Build and test in one step |
 | `npm run typecheck` | Type check without emitting |
 | `npm run clean` | Remove build output |
+
+Tests use Node's built-in runner with no test framework dependency. They run against compiled output, so `npm test` builds first.
 | `npm run start:target` | Run the demo target |
 | `npm run start:app` | Run the SupaScraper app |
 

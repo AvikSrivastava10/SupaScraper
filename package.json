@@ -15,6 +15,9 @@
     "build": "tsc -b --pretty false",
     "typecheck": "tsc -b --pretty false",
     "clean": "tsc -b --clean",
+    "pretest": "npm run build",
+    "test": "node --experimental-strip-types --test \"apps/*/tests/*.test.ts\"",
+    "verify": "npm run build && npm test",
     "start:target": "npm run start --workspace @supascraper/target-site",
     "start:app": "npm run start --workspace @supascraper/app"
   },

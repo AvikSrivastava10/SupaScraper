@@ -1,25 +1,27 @@
 import type { CatalogRecord } from "@supascraper/shared";
 
+import type { OrchestrationState } from "../../domain/state-machine/state-machine.js";
+
 export interface DashboardStatus {
   readonly configured: boolean;
   readonly collectorId: string | null;
   readonly targetUrl: string | null;
-  readonly state: "idle";
+  readonly state: OrchestrationState;
   readonly records: readonly CatalogRecord[];
   readonly collectedAt: string | null;
   readonly eventCount: number;
 }
 
+const HTML_ENTITIES: Readonly<Record<string, string>> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
 function escapeHtml(value: string): string {
-  return value.replaceAll(/[&<>"]/g, (character) => {
-    const entities: Readonly<Record<string, string>> = {
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",
-    };
-    return entities[character] ?? character;
-  });
+  return value.replaceAll(/[&<>"']/g, (character) => HTML_ENTITIES[character] ?? character);
 }
 
 function renderRows(records: readonly CatalogRecord[]): string {

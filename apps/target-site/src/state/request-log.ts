@@ -4,7 +4,8 @@ export interface LoggedRequest {
   readonly url: string;
   readonly status: number;
   readonly userAgent: string;
-  readonly forwardedFor: string;
+  /** Coarse description only; never an IP address. */
+  readonly client: string;
 }
 
 /**

@@ -3,17 +3,16 @@ import type { CatalogRecord, ScenarioMode } from "@supascraper/shared";
 import { recordsForScenario } from "../scenarios/catalog-scenarios.js";
 import type { HttpResponse } from "./http-response.js";
 
-function escapeHtml(value: string): string {
-  return value.replaceAll(/[&<>"]/g, (character) => {
-    const entities: Readonly<Record<string, string>> = {
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",
-    };
+const HTML_ENTITIES: Readonly<Record<string, string>> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
 
-    return entities[character] ?? character;
-  });
+function escapeHtml(value: string): string {
+  return value.replaceAll(/[&<>"']/g, (character) => HTML_ENTITIES[character] ?? character);
 }
 
 function formatPrice(price: number): string {

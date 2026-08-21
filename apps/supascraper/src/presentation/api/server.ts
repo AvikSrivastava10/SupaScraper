@@ -41,7 +41,10 @@ async function buildStatus(
     configured: true,
     collectorId: config.collector.collectorId,
     targetUrl: config.collector.targetUrl,
-    state: "idle",
+    // Only two states are reachable until the orchestrator persists its own
+    // state in a later phase. Reporting a fixed "idle" while holding verified
+    // data would misrepresent the system.
+    state: snapshot ? "healthy" : "idle",
     records: snapshot?.records ?? [],
     collectedAt: snapshot?.collectedAt ?? null,
     eventCount: events.length,

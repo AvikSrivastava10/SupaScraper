@@ -14,6 +14,35 @@ import type { ScenarioStore } from "./state/scenario-store.js";
 
 const MAX_CONTROL_BODY_BYTES = 16 * 1024;
 
+export class PayloadTooLargeError extends Error {
+  constructor() {
+    super("Request body is too large.");
+    this.name = "PayloadTooLargeError";
+  }
+}
+
+/**
+ * Summarizes the caller without retaining an IP address.
+ *
+ * The diagnostic log exists to reveal which paths a remote scraper requests,
+ * which does not require identifying individual visitors. Storing full
+ * `x-forwarded-for` values on a public site would retain personal data for no
+ * operational benefit, so only the hop count is kept.
+ */
+export function describeClient(forwardedFor: string | string[] | undefined): string {
+  if (forwardedFor === undefined) {
+    return "direct";
+  }
+
+  const raw = Array.isArray(forwardedFor) ? forwardedFor.join(",") : forwardedFor;
+  const hops = raw
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0).length;
+
+  return hops === 0 ? "direct" : `proxied (${String(hops)} hop${hops === 1 ? "" : "s"})`;
+}
+
 /**
  * Container hosts inject `PORT`, so it takes precedence over the local
  * `TARGET_SITE_PORT` override.
@@ -27,7 +56,10 @@ export function resolvePort(
     return fallback;
   }
 
-  const port = Number.parseInt(source, 10);
+  // parseInt would silently accept "1.5.5" as 1 and "3000abc" as 3000, turning
+  // a typo into a different working port. Require a clean integer instead.
+  const trimmed = source.trim();
+  const port = /^\d+$/.test(trimmed) ? Number(trimmed) : Number.NaN;
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error(
       "PORT/TARGET_SITE_PORT must be an integer between 1 and 65535.",
@@ -46,7 +78,9 @@ async function readJsonBody(request: IncomingMessage): Promise<unknown> {
     totalBytes += buffer.length;
 
     if (totalBytes > MAX_CONTROL_BODY_BYTES) {
-      throw new Error("Request body is too large.");
+      // Stop buffering, but leave the socket alive long enough to deliver the
+      // 413. Destroying it here would surface as a network error instead.
+      throw new PayloadTooLargeError();
     }
 
     chunks.push(buffer);
@@ -89,9 +123,17 @@ export function createTargetServer(
   const controlToken = process.env["TARGET_CONTROL_TOKEN"];
   const requestLog = new RequestLog();
 
-  return createServer(async (request, response) => {
-    const url = new URL(request.url ?? "/", "http://localhost");
-    const path = normalizePath(url.pathname);
+  const route = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> => {
+    let path: string;
+    try {
+      path = normalizePath(new URL(request.url ?? "/", "http://localhost").pathname);
+    } catch {
+      writeResponse(response, jsonResponse(400, { error: "Malformed request URL." }));
+      return;
+    }
 
     response.once("finish", () => {
       if (path === "/__control/requests") {
@@ -103,7 +145,7 @@ export function createTargetServer(
         url: request.url ?? "?",
         status: response.statusCode,
         userAgent: request.headers["user-agent"] ?? "-",
-        forwardedFor: String(request.headers["x-forwarded-for"] ?? "-"),
+        client: describeClient(request.headers["x-forwarded-for"]),
       });
     });
 
@@ -131,30 +173,67 @@ export function createTargetServer(
     }
 
     if (request.method === "GET" && path.startsWith("/product/")) {
-      const sku = decodeURIComponent(path.slice("/product/".length));
+      let sku: string;
+      try {
+        // A malformed percent-escape such as `/product/%` throws a URIError.
+        sku = decodeURIComponent(path.slice("/product/".length));
+      } catch {
+        writeResponse(response, jsonResponse(400, { error: "Malformed product path." }));
+        return;
+      }
       writeResponse(response, buildProductResponse(scenarioStore.get(), sku));
       return;
     }
 
     if (request.method === "POST" && path === "/__control/scenario") {
+      let body: unknown;
       try {
-        const body = await readJsonBody(request);
-        writeResponse(
-          response,
-          handleScenarioControl(
-            body,
-            request.headers.authorization,
-            controlToken,
-            scenarioStore,
-          ),
-        );
-      } catch {
+        body = await readJsonBody(request);
+      } catch (error) {
+        if (error instanceof PayloadTooLargeError) {
+          response.once("finish", () => {
+            request.destroy();
+          });
+          writeResponse(response, {
+            statusCode: 413,
+            headers: {
+              "content-type": "application/json; charset=utf-8",
+              "cache-control": "no-store",
+              connection: "close",
+            },
+            body: JSON.stringify({ error: "Request body is too large." }),
+          });
+          return;
+        }
         writeResponse(response, jsonResponse(400, { error: "Invalid JSON body." }));
+        return;
       }
+
+      writeResponse(
+        response,
+        handleScenarioControl(
+          body,
+          request.headers.authorization,
+          controlToken,
+          scenarioStore,
+        ),
+      );
       return;
     }
 
     writeResponse(response, jsonResponse(404, { error: "Not found." }));
+  };
+
+  return createServer((request, response) => {
+    // Any throw here would otherwise become an unhandled rejection and leave
+    // the client waiting until its own timeout.
+    void route(request, response).catch(() => {
+      if (response.headersSent) {
+        response.end();
+        return;
+      }
+      writeResponse(response, jsonResponse(500, { error: "Internal server error." }));
+    });
   });
 }
 
