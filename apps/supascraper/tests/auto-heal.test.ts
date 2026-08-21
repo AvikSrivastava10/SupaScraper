@@ -69,6 +69,7 @@ interface Recorder {
   readonly calls: { heal: number; approve: number; reject: number; verify: number };
   readonly store: {
     saveLastKnownGood: (id: string, records: readonly never[], at: string) => Promise<void>;
+    getLastKnownGood: () => Promise<{ records: readonly never[] } | null>;
     appendEvent: (event: RepairEvent) => Promise<void>;
   };
   readonly repair: HealAndVerifyDependencies;
@@ -77,16 +78,22 @@ interface Recorder {
 function recorder(options: {
   healEnvelope?: HealEnvelope;
   verificationRecords?: readonly unknown[];
+  baseline?: readonly unknown[];
 } = {}): Recorder {
   const events: RepairEvent[] = [];
   const published: { records: readonly unknown[]; at: string }[] = [];
   const calls = { heal: 0, approve: 0, reject: 0, verify: 0 };
 
+  let baseline: readonly unknown[] | null = options.baseline ?? null;
+
   const store = {
     saveLastKnownGood: (_id: string, records: readonly never[], at: string) => {
       published.push({ records, at });
+      baseline = records;
       return Promise.resolve();
     },
+    getLastKnownGood: () =>
+      Promise.resolve(baseline === null ? null : { records: baseline as never[] }),
     appendEvent: (event: RepairEvent) => {
       events.push(event);
       return Promise.resolve();

@@ -105,6 +105,7 @@ function harness(options: {
         calls.publish += 1;
         return Promise.resolve();
       },
+      getLastKnownGood: () => Promise.resolve(null),
     },
     lock: {
       acquire: () => Promise.resolve(options.lockAvailable === false ? null : "token"),

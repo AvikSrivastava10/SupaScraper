@@ -29,6 +29,9 @@ export interface CatalogDataStore {
     records: readonly CatalogRecord[],
     collectedAt: string,
   ): Promise<void>;
+  getLastKnownGood(
+    collectorId: string,
+  ): Promise<{ readonly records: readonly CatalogRecord[] } | null>;
 }
 
 export interface RepairEventStore {
@@ -93,7 +96,12 @@ export async function processCollectorRun(
   options: ProcessRunOptions = {},
 ): Promise<ProcessRunResult> {
   const evaluation = evaluateCatalogContract(run.records);
-  const decision = classifyRun(run, evaluation);
+
+  // The previously verified data is the only reference that can distinguish a
+  // real data change from a partially broken extraction.
+  const previous = await dataStore.getLastKnownGood(run.collectorId);
+  const decision = classifyRun(run, evaluation, previous?.records ?? null);
+
   const publishable =
     decision.recommendedAction === "publish" && evaluation.valid && run.records.length > 0;
 
