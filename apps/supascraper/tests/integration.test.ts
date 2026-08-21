@@ -343,10 +343,12 @@ describe("JsonFileRepository", () => {
 });
 
 describe("dashboard rendering", () => {
-  const base = {
-    configured: true,
+  const target = {
+    id: "demo",
+    label: "Demo target",
     collectorId: "c_test",
     targetUrl: "https://example.test/catalog",
+    controllable: true,
     records: [{ name: "Motor", sku: "MTR-100", price: 49.95, availability: "in_stock" as const }],
     collectedAt: new Date().toISOString(),
     events: [],
@@ -354,10 +356,17 @@ describe("dashboard rendering", () => {
     lastError: null,
   };
 
+  const page = (state: string, overrides: Record<string, unknown> = {}) =>
+    renderDashboardPage({
+      configured: true,
+      autoHealEnabled: true,
+      geminiEnabled: false,
+      scheduleMinutes: null,
+      targets: [{ ...target, state, ...overrides }],
+    } as never);
+
   it("escapes markup in catalog values", () => {
-    const html = renderDashboardPage({
-      ...base,
-      state: "healthy",
+    const html = page("healthy", {
       records: [
         { name: "<script>alert(1)</script>", sku: "X'1", price: 1, availability: "in_stock" },
       ],
@@ -368,7 +377,12 @@ describe("dashboard rendering", () => {
   });
 
   it("shows the collector id, since it is the proof of platform use", () => {
-    assert.ok(renderDashboardPage({ ...base, state: "healthy" }).includes("c_test"));
+    assert.ok(page("healthy").includes("c_test"));
+  });
+
+  it("distinguishes a controlled site from one we do not control", () => {
+    assert.match(page("healthy", { controllable: true }), /layout switchable/);
+    assert.match(page("healthy", { controllable: false }), /site we do not control/);
   });
 
   it("renders every orchestration state with a text label", () => {
@@ -385,7 +399,7 @@ describe("dashboard rendering", () => {
       "manual_review",
     ] as const;
     for (const state of states) {
-      const html = renderDashboardPage({ ...base, state });
+      const html = page(state);
       assert.ok(html.includes("<h1>SupaScraper</h1>"), state);
       assert.ok(/class="value state \w+"/.test(html), state);
     }
@@ -404,18 +418,14 @@ describe("dashboard rendering", () => {
 
     for (const state of withholding) {
       assert.equal(isShowingStaleData(state, true), true, state);
-      assert.match(renderDashboardPage({ ...base, state }), /output was withheld/i, state);
+      assert.match(page(state), /output was withheld/i, state);
     }
   });
 
   it("does not claim data is stale when it is current", () => {
     for (const state of ["healthy", "recovered", "idle", "running"] as const) {
       assert.equal(isShowingStaleData(state, true), false, state);
-      assert.doesNotMatch(
-        renderDashboardPage({ ...base, state }),
-        /output was withheld/i,
-        state,
-      );
+      assert.doesNotMatch(page(state), /output was withheld/i, state);
     }
   });
 
@@ -423,18 +433,45 @@ describe("dashboard rendering", () => {
     assert.equal(isShowingStaleData("manual_review", false), false);
   });
 
+  it("renders several targets on one page", () => {
+    const html = renderDashboardPage({
+      configured: true,
+      autoHealEnabled: true,
+      geminiEnabled: false,
+      scheduleMinutes: 30,
+      targets: [
+        { ...target, state: "healthy" },
+        {
+          ...target,
+          id: "books",
+          label: "Real external site",
+          collectorId: "c_other",
+          controllable: false,
+          state: "recovered",
+        },
+      ],
+    } as never);
+
+    assert.ok(html.includes("Demo target"));
+    assert.ok(html.includes("Real external site"));
+    assert.ok(html.includes("c_other"));
+    assert.match(html, /every 30 min/);
+  });
+
   it("handles the empty and unconfigured cases", () => {
     const empty = renderDashboardPage({
-      ...base,
       configured: false,
-      collectorId: null,
-      records: [],
-      collectedAt: null,
-      state: "idle",
-    });
-    assert.ok(empty.includes("No verified catalog data"));
-    assert.ok(empty.includes("No collector configured"));
-    assert.ok(empty.includes("never"));
+      autoHealEnabled: false,
+      geminiEnabled: false,
+      scheduleMinutes: null,
+      targets: [],
+    } as never);
+    assert.ok(empty.includes("No targets configured"));
+    assert.ok(empty.includes("auto-repair off"));
+
+    const noData = page("idle", { records: [], collectedAt: null });
+    assert.ok(noData.includes("No verified data collected yet"));
+    assert.ok(noData.includes("never"));
   });
 });
 
@@ -492,22 +529,27 @@ describe("application server", () => {
   it("reports health without exposing configuration detail", async () => {
     const body = (await (await fetch(`${base}/health`)).json()) as Record<string, unknown>;
     assert.equal(body["status"], "ok");
-    assert.equal(body["collectorConfigured"], true);
+    assert.equal(body["targets"], 1);
     assert.equal(body["exposed"], false);
   });
 
-  const readStatus = async (): Promise<{
+  interface TargetView {
     records: unknown[];
     state: string;
     busy: boolean;
     events: { classification: string }[];
-  }> =>
-    (await (await fetch(`${base}/api/status`)).json()) as {
-      records: unknown[];
-      state: string;
-      busy: boolean;
-      events: { classification: string }[];
+  }
+
+  const readStatus = async (): Promise<TargetView> => {
+    const body = (await (await fetch(`${base}/api/status`)).json()) as {
+      targets: TargetView[];
     };
+    const first = body.targets[0];
+    if (first === undefined) {
+      throw new Error("expected at least one target");
+    }
+    return first;
+  };
 
   /** The trigger is asynchronous, so settle before asserting on the outcome. */
   const waitForIdle = async (): Promise<Awaited<ReturnType<typeof readStatus>>> => {
@@ -573,7 +615,7 @@ describe("application server", () => {
               setTimeout(() => resolve(runResult), 300);
             }),
         },
-        logger: new ConsoleLogger(),
+        logger: { info: () => undefined, error: () => undefined },
       },
     );
 
@@ -593,12 +635,11 @@ describe("application server", () => {
       assert.equal(first.status, 202);
       assert.equal(second.status, 409);
 
-      const busy = (await (await fetch(`${slowBase}/api/status`)).json()) as {
-        busy: boolean;
-        state: string;
+      const body = (await (await fetch(`${slowBase}/api/status`)).json()) as {
+        targets: { busy: boolean; state: string }[];
       };
-      assert.equal(busy.busy, true);
-      assert.equal(busy.state, "running");
+      assert.equal(body.targets[0]?.busy, true);
+      assert.equal(body.targets[0]?.state, "running");
     } finally {
       await new Promise<void>((resolve) => {
         slowServer.close(() => resolve());

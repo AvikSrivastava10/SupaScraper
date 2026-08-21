@@ -1,4 +1,9 @@
 import type { CollectorConfig } from "../domain/contracts/collector-run.js";
+import {
+  loadTargetsFile,
+  singleTarget,
+  type TargetConfig,
+} from "./targets.js";
 
 export interface AppConfig {
   readonly host: string;
@@ -10,6 +15,9 @@ export interface AppConfig {
   /** Null means no unattended runs. */
   readonly scheduleIntervalMs: number | null;
   readonly apiToken: string | null;
+  /** Every site being monitored. Empty means nothing is configured. */
+  readonly targets: readonly TargetConfig[];
+  /** Retained for the single-collector path; prefer `targets`. */
   readonly collector: CollectorConfig | null;
 }
 
@@ -123,9 +131,23 @@ export function loadConfig(
     );
   }
 
+  const collector = loadCollectorConfig(environment);
+  const targetsPath = environment["SUPASCRAPER_TARGETS_PATH"];
+  const defaultTimeout = collector?.timeoutMs ?? 420_000;
+
+  // A targets file supports several sites at once. Without one, the single
+  // environment-configured collector is used, so existing setups keep working.
+  const targets =
+    targetsPath !== undefined && targetsPath !== ""
+      ? loadTargetsFile(targetsPath, defaultTimeout)
+      : collector === null
+        ? []
+        : [singleTarget(collector)];
+
   return {
     host,
     port,
+    targets,
     dataPath: environment["SUPASCRAPER_DATA_PATH"] ?? "./data/supascraper-state.json",
     geminiEnabled: parseBoolean(
       environment["SUPASCRAPER_GEMINI_ENABLED"],
@@ -137,6 +159,6 @@ export function loadConfig(
     ),
     scheduleIntervalMs,
     apiToken,
-    collector: loadCollectorConfig(environment),
+    collector,
   };
 }

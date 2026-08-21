@@ -24,16 +24,17 @@ export function startApplication(): void {
   const logger = new ConsoleLogger();
   const repository = new JsonFileRepository(config.dataPath);
 
-  // Without a configured collector there is nothing to run, so the adapter that
+  // Without a configured target there is nothing to run, so the adapter that
   // refuses every operation is the honest choice.
-  const adapter = config.collector
-    ? new BrightDataCliAdapter(new ProcessCliRunner(), logger)
-    : new UnconfiguredBrightDataAdapter();
+  const adapter =
+    config.targets.length > 0
+      ? new BrightDataCliAdapter(new ProcessCliRunner(), logger)
+      : new UnconfiguredBrightDataAdapter();
 
   // Repair dependencies are only assembled when automatic healing is enabled,
   // so an accidental code path cannot mutate a collector.
   const repair: HealAndVerifyDependencies | undefined =
-    config.autoHealEnabled && config.collector
+    config.autoHealEnabled && config.targets.length > 0
       ? {
           healer: adapter,
           approver: adapter,
@@ -70,16 +71,24 @@ export function startApplication(): void {
     logger.info("SupaScraper is listening.", {
       host: config.host,
       port: config.port,
-      collectorConfigured: config.collector !== null,
+      targets: config.targets.length,
       autoHealEnabled: repair !== undefined,
       geminiEnabled: reasoner !== undefined,
       runEndpointProtected: config.apiToken !== null,
     });
 
+    for (const target of config.targets) {
+      logger.info("Monitoring target.", {
+        id: target.id,
+        collectorId: target.collectorId,
+        url: target.targetUrl,
+        controllable: target.controllable,
+      });
+    }
+
     if (repair !== undefined) {
       logger.info(
         "Automatic repair is enabled. A confident structural break will heal, review the preview, approve with save, and verify.",
-        { collectorId: config.collector?.collectorId ?? "none" },
       );
     }
 
@@ -92,7 +101,7 @@ export function startApplication(): void {
 
     // The schedule reuses the server's guarded trigger, so unattended runs obey
     // the same in-flight guard and publication rules as a manual one.
-    if (config.scheduleIntervalMs !== null && config.collector !== null) {
+    if (config.scheduleIntervalMs !== null && config.targets.length > 0) {
       scheduler = startScheduler({
         intervalMs: config.scheduleIntervalMs,
         trigger: () => app.triggerRun(),
