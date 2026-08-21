@@ -20,11 +20,11 @@ Built for the WeMakeDevs "Into the Scrape-Verse" hackathon (17–23 August 2026)
 | Break, heal, approve, recover against a live collector | Verified end to end; recovered data byte-identical to baseline |
 | Collector integration inside the app | Adapter deliberately fails closed; not wired into the running server yet |
 | Contract validation and run classification | Implemented and unit-tested |
-| Heal → approve → verify orchestration | Implemented, gate-enforced, unit-tested; not wired into the running server yet |
-| Automated test suite | 90 tests, no external dependencies |
-| Dashboard | Minimal status view only |
+| Unattended heal → review → approve → verify | Verified live; a real break repaired itself and rows went 0/0 to 3/3 |
+| Automated test suite | 148 tests, no test framework dependency |
+| Dashboard | Catalog, status, freshness, and repair timeline |
 
-The orchestration logic is exercised by tests rather than by the running server: `main.ts` currently serves health, status, and the dashboard, and does not trigger collector runs. Wiring that up is the next phase.
+Automatic repair is off unless `SUPASCRAPER_AUTO_HEAL=true`, and the repair dependencies are only assembled when it is enabled, so no accidental code path can mutate a hosted collector.
 
 The Bright Data adapter intentionally throws rather than pretending to work, so nothing can silently report a fake repair.
 
@@ -156,6 +156,17 @@ node node_modules/@brightdata/cli/dist/index.js scraper approve <collector_id>
 ```
 
 `scraper heal` stops at an approval gate and returns a preview plus a diff summary. That gate is the point where SupaScraper checks the proposed fix for plausibility before committing it, and a successful heal command is never treated as proof of recovery on its own.
+
+Note that `approve` must be given `--auto-save`. Without it the flow ends at `user_approval`, the healed template is never persisted, and the collector keeps failing while every command reports success.
+
+## Triggering a run
+
+```bash
+curl -X POST http://localhost:3000/api/run     # returns 202
+curl http://localhost:3000/api/status          # poll for the outcome
+```
+
+The trigger returns immediately because a repair takes minutes. Progress appears in `/api/status` and on the dashboard, which refreshes while a run is in flight.
 
 ## Configuration
 
