@@ -350,6 +350,8 @@ describe("dashboard rendering", () => {
     records: [{ name: "Motor", sku: "MTR-100", price: 49.95, availability: "in_stock" as const }],
     collectedAt: new Date().toISOString(),
     events: [],
+    busy: false,
+    lastError: null,
   };
 
   it("escapes markup in catalog values", () => {
@@ -494,19 +496,44 @@ describe("application server", () => {
     assert.equal(body["exposed"], false);
   });
 
-  it("publishes verified data through a manual run", async () => {
-    const response = await fetch(`${base}/api/run`, { method: "POST" });
-    const body = (await response.json()) as Record<string, unknown>;
-    assert.equal(response.status, 200);
-    assert.equal(body["classification"], "healthy");
-    assert.equal(body["published"], true);
-
-    const status = (await (await fetch(`${base}/api/status`)).json()) as {
+  const readStatus = async (): Promise<{
+    records: unknown[];
+    state: string;
+    busy: boolean;
+    events: { classification: string }[];
+  }> =>
+    (await (await fetch(`${base}/api/status`)).json()) as {
       records: unknown[];
       state: string;
+      busy: boolean;
+      events: { classification: string }[];
     };
+
+  /** The trigger is asynchronous, so settle before asserting on the outcome. */
+  const waitForIdle = async (): Promise<Awaited<ReturnType<typeof readStatus>>> => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const status = await readStatus();
+      if (!status.busy) {
+        return status;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("run did not settle");
+  };
+
+  it("accepts a run without holding the request open", async () => {
+    const response = await fetch(`${base}/api/run`, { method: "POST" });
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as Record<string, unknown>;
+    assert.equal(body["accepted"], true);
+  });
+
+  it("publishes verified data once the run settles", async () => {
+    await fetch(`${base}/api/run`, { method: "POST" });
+    const status = await waitForIdle();
     assert.equal(status.records.length, 1);
     assert.equal(status.state, "healthy");
+    assert.equal(status.events[0]?.classification, "healthy");
   });
 
   it("does not overwrite last known good data when a run breaks", async () => {
@@ -522,17 +549,61 @@ describe("application server", () => {
       ],
     };
 
-    const response = await fetch(`${base}/api/run`, { method: "POST" });
-    const body = (await response.json()) as Record<string, unknown>;
-    assert.equal(body["classification"], "structural_break");
-    assert.equal(body["published"], false);
+    await fetch(`${base}/api/run`, { method: "POST" });
+    const status = await waitForIdle();
 
-    const status = (await (await fetch(`${base}/api/status`)).json()) as {
-      records: unknown[];
-      state: string;
-    };
+    assert.equal(status.events[0]?.classification, "structural_break");
     assert.equal(status.records.length, 1, "previous verified data must survive");
     assert.equal(status.state, "suspected");
+  });
+
+  it("refuses a second trigger while one is in flight", async () => {
+    // A slow runner keeps the first request active long enough to collide.
+    const slowServer = createApplicationServer(
+      loadConfig({
+        SUPASCRAPER_COLLECTOR_ID: "c_test",
+        SUPASCRAPER_TARGET_URL: "https://example.test/catalog",
+        SUPASCRAPER_DATA_PATH: join(directory, "busy.json"),
+      }),
+      {
+        repository: new JsonFileRepository(join(directory, "busy.json")),
+        runner: {
+          run: () =>
+            new Promise((resolve) => {
+              setTimeout(() => resolve(runResult), 300);
+            }),
+        },
+        logger: new ConsoleLogger(),
+      },
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      slowServer.once("error", reject);
+      slowServer.listen(0, "127.0.0.1", resolve);
+    });
+    const address = slowServer.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("expected a TCP address");
+    }
+    const slowBase = `http://127.0.0.1:${String(address.port)}`;
+
+    try {
+      const first = await fetch(`${slowBase}/api/run`, { method: "POST" });
+      const second = await fetch(`${slowBase}/api/run`, { method: "POST" });
+      assert.equal(first.status, 202);
+      assert.equal(second.status, 409);
+
+      const busy = (await (await fetch(`${slowBase}/api/status`)).json()) as {
+        busy: boolean;
+        state: string;
+      };
+      assert.equal(busy.busy, true);
+      assert.equal(busy.state, "running");
+    } finally {
+      await new Promise<void>((resolve) => {
+        slowServer.close(() => resolve());
+      });
+    }
   });
 
   it("serves the dashboard and a 404 for unknown paths", async () => {

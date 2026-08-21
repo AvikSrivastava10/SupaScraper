@@ -11,6 +11,8 @@ export interface DashboardStatus {
   readonly records: readonly CatalogRecord[];
   readonly collectedAt: string | null;
   readonly events: readonly RepairEvent[];
+  readonly busy: boolean;
+  readonly lastError: string | null;
 }
 
 const HTML_ENTITIES: Readonly<Record<string, string>> = {
@@ -129,6 +131,7 @@ export function renderDashboardPage(status: DashboardStatus): string {
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    ${status.busy ? `<meta http-equiv="refresh" content="10">` : ""}
     <title>SupaScraper</title>
     <style>
       :root { color-scheme: dark; --good:#4ade80; --warn:#fbbf24; --bad:#f87171; --busy:#60a5fa; --idle:#94a3b8; }
@@ -185,7 +188,9 @@ export function renderDashboardPage(status: DashboardStatus): string {
             <div class="value">${String(status.records.length)}</div>
           </div>
         </div>
+        ${status.busy ? `<p class="notice" style="margin-top:1rem">A run is in progress. If a repair is needed it can take several minutes; this page refreshes automatically.</p>` : ""}
         ${stale ? `<p class="notice" style="margin-top:1rem">Showing the last verified data. The most recent run did not satisfy the expected contract, so its output was withheld.</p>` : ""}
+        ${status.lastError === null ? "" : `<p class="notice" style="margin-top:1rem">Last run failed: ${escapeHtml(status.lastError)}</p>`}
         ${status.configured ? "" : `<p class="notice" style="margin-top:1rem">No collector configured. Set SUPASCRAPER_COLLECTOR_ID and SUPASCRAPER_TARGET_URL.</p>`}
       </section>
 

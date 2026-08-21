@@ -9,6 +9,7 @@ import type {
   CatalogDataStore,
   RepairEventStore,
 } from "../../application/process-run/process-run.js";
+import type { HealAndVerifyDependencies } from "../../application/heal-and-verify/heal-and-verify.js";
 import type { Logger } from "../../infrastructure/logging/logger.js";
 import type { DashboardDataReader } from "../../infrastructure/persistence/in-memory-repository.js";
 import { renderDashboardPage, type DashboardStatus } from "../web/dashboard-page.js";
@@ -17,6 +18,8 @@ export interface ApplicationDependencies {
   readonly repository: DashboardDataReader & CatalogDataStore & RepairEventStore;
   readonly runner: CollectorRunner;
   readonly logger: Logger;
+  /** Supplied only when automatic repair is enabled. */
+  readonly repair?: HealAndVerifyDependencies;
 }
 
 function writeJson(response: ServerResponse, statusCode: number, value: unknown): void {
@@ -39,6 +42,7 @@ function tokenAccepted(supplied: string | undefined, expected: string): boolean 
 async function buildStatus(
   config: AppConfig,
   repository: DashboardDataReader,
+  runtime: { readonly busy: boolean; readonly lastError: string | null },
 ): Promise<DashboardStatus> {
   if (!config.collector) {
     return {
@@ -49,6 +53,8 @@ async function buildStatus(
       records: [],
       collectedAt: null,
       events: [],
+      busy: runtime.busy,
+      lastError: runtime.lastError,
     };
   }
 
@@ -64,12 +70,15 @@ async function buildStatus(
     configured: true,
     collectorId: config.collector.collectorId,
     targetUrl: config.collector.targetUrl,
-    // Derived from the most recent event so the screen never claims a state the
-    // recorded history does not support.
-    state: latest?.state ?? (snapshot ? "healthy" : "idle"),
+    // A run in progress outranks history; otherwise the state is derived from
+    // the most recent event so the screen never claims something the recorded
+    // history does not support.
+    state: runtime.busy ? "running" : (latest?.state ?? (snapshot ? "healthy" : "idle")),
     records: snapshot?.records ?? [],
     collectedAt: snapshot?.collectedAt ?? null,
     events: recent,
+    busy: runtime.busy,
+    lastError: runtime.lastError,
   };
 }
 
@@ -77,8 +86,13 @@ export function createApplicationServer(
   config: AppConfig,
   dependencies: ApplicationDependencies,
 ) {
-  const { repository, runner, logger } = dependencies;
-  let runInFlight = false;
+  const { repository, runner, logger, repair } = dependencies;
+
+  // A run that triggers a repair takes many minutes, so the request must not be
+  // held open for it. The trigger is accepted and the outcome is observed
+  // through /api/status.
+  let activeRun: Promise<void> | null = null;
+  let lastRunError: string | null = null;
 
   const handleRun = async (
     request: IncomingMessage,
@@ -94,37 +108,41 @@ export function createApplicationServer(
       return;
     }
 
-    // A run costs credit and takes time; overlapping triggers would double the
-    // spend and confuse the recorded history.
-    if (runInFlight) {
+    // A run costs credit; overlapping triggers would double the spend and
+    // confuse the recorded history.
+    if (activeRun !== null) {
       writeJson(response, 409, { error: "A run is already in progress." });
       return;
     }
 
-    runInFlight = true;
-    try {
-      const run = await runCollector(config.collector, runner);
-      const outcome = await processCollectorRun(run, repository, repository);
-      writeJson(response, 200, {
-        status: run.status,
-        classification: outcome.decision.classification,
-        recommendedAction: outcome.decision.recommendedAction,
-        evidence: outcome.decision.evidence,
-        published: outcome.published,
-        rowCount: outcome.evaluation.metrics.rowCount,
-        validRowCount: outcome.evaluation.metrics.validRowCount,
+    const collector = config.collector;
+    lastRunError = null;
+
+    activeRun = (async () => {
+      const run = await runCollector(collector, runner);
+      await processCollectorRun(run, repository, repository, {
+        autoHealEnabled: config.autoHealEnabled && repair !== undefined,
+        config: collector,
+        ...(repair === undefined ? {} : { repair }),
       });
-    } catch (error) {
-      logger.error("Manual collector run failed.", {
-        collectorId: config.collector.collectorId,
-        reason: error instanceof Error ? error.message : "unknown",
+    })()
+      .catch((error: unknown) => {
+        lastRunError =
+          error instanceof Error ? error.message : "The collector run failed.";
+        logger.error("Collector run failed.", {
+          collectorId: collector.collectorId,
+          reason: lastRunError,
+        });
+      })
+      .finally(() => {
+        activeRun = null;
       });
-      writeJson(response, 502, {
-        error: "The collector run could not be completed.",
-      });
-    } finally {
-      runInFlight = false;
-    }
+
+    writeJson(response, 202, {
+      accepted: true,
+      autoHealEnabled: config.autoHealEnabled && repair !== undefined,
+      message: "Run started. Poll /api/status for the outcome.",
+    });
   };
 
   return createServer((request, response) => {
@@ -147,7 +165,14 @@ export function createApplicationServer(
       }
 
       if (request.method === "GET" && pathname === "/api/status") {
-        writeJson(response, 200, await buildStatus(config, repository));
+        writeJson(
+          response,
+          200,
+          await buildStatus(config, repository, {
+            busy: activeRun !== null,
+            lastError: lastRunError,
+          }),
+        );
         return;
       }
 
@@ -160,7 +185,10 @@ export function createApplicationServer(
       }
 
       if (request.method === "GET" && pathname === "/") {
-        const status = await buildStatus(config, repository);
+        const status = await buildStatus(config, repository, {
+          busy: activeRun !== null,
+          lastError: lastRunError,
+        });
         response.writeHead(200, {
           "content-type": "text/html; charset=utf-8",
           "cache-control": "no-store",

@@ -1,5 +1,9 @@
 import { pathToFileURL } from "node:url";
 
+import {
+  ContractPreviewReviewer,
+  type HealAndVerifyDependencies,
+} from "./application/heal-and-verify/heal-and-verify.js";
 import { isLoopbackHost, loadConfig } from "./config/config.js";
 import {
   BrightDataCliAdapter,
@@ -17,11 +21,30 @@ export function startApplication(): void {
 
   // Without a configured collector there is nothing to run, so the adapter that
   // refuses every operation is the honest choice.
-  const runner = config.collector
+  const adapter = config.collector
     ? new BrightDataCliAdapter(new ProcessCliRunner(), logger)
     : new UnconfiguredBrightDataAdapter();
 
-  const server = createApplicationServer(config, { repository, runner, logger });
+  // Repair dependencies are only assembled when automatic healing is enabled,
+  // so an accidental code path cannot mutate a collector.
+  const repair: HealAndVerifyDependencies | undefined =
+    config.autoHealEnabled && config.collector
+      ? {
+          healer: adapter,
+          approver: adapter,
+          reviewer: new ContractPreviewReviewer(),
+          runner: adapter,
+          dataStore: repository,
+          lock: repository,
+        }
+      : undefined;
+
+  const server = createApplicationServer(config, {
+    repository,
+    runner: adapter,
+    logger,
+    ...(repair === undefined ? {} : { repair }),
+  });
 
   server.listen(config.port, config.host, () => {
     logger.info("SupaScraper is listening.", {
@@ -29,8 +52,16 @@ export function startApplication(): void {
       port: config.port,
       collectorConfigured: config.collector !== null,
       geminiEnabled: config.geminiEnabled,
+      autoHealEnabled: repair !== undefined,
       runEndpointProtected: config.apiToken !== null,
     });
+
+    if (repair !== undefined) {
+      logger.info(
+        "Automatic repair is enabled. A confident structural break will heal, review the preview, approve with save, and verify.",
+        { collectorId: config.collector?.collectorId ?? "none" },
+      );
+    }
 
     if (!isLoopbackHost(config.host)) {
       logger.info(

@@ -5,6 +5,8 @@ export interface AppConfig {
   readonly port: number;
   readonly dataPath: string;
   readonly geminiEnabled: boolean;
+  /** Off unless explicitly enabled: healing mutates a hosted collector. */
+  readonly autoHealEnabled: boolean;
   readonly apiToken: string | null;
   readonly collector: CollectorConfig | null;
 }
@@ -32,14 +34,14 @@ function parsePositiveInteger(
   return parsed;
 }
 
-function parseBoolean(value: string | undefined): boolean {
-  if (value === undefined || value === "false") {
+function parseBoolean(value: string | undefined, name: string): boolean {
+  if (value === undefined || value === "" || value === "false") {
     return false;
   }
   if (value === "true") {
     return true;
   }
-  throw new Error("SUPASCRAPER_GEMINI_ENABLED must be true or false.");
+  throw new Error(`${name} must be true or false.`);
 }
 
 function loadCollectorConfig(environment: NodeJS.ProcessEnv): CollectorConfig | null {
@@ -106,7 +108,14 @@ export function loadConfig(
     host,
     port,
     dataPath: environment["SUPASCRAPER_DATA_PATH"] ?? "./data/supascraper-state.json",
-    geminiEnabled: parseBoolean(environment["SUPASCRAPER_GEMINI_ENABLED"]),
+    geminiEnabled: parseBoolean(
+      environment["SUPASCRAPER_GEMINI_ENABLED"],
+      "SUPASCRAPER_GEMINI_ENABLED",
+    ),
+    autoHealEnabled: parseBoolean(
+      environment["SUPASCRAPER_AUTO_HEAL"],
+      "SUPASCRAPER_AUTO_HEAL",
+    ),
     apiToken,
     collector: loadCollectorConfig(environment),
   };
