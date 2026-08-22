@@ -1,883 +1,222 @@
-import type { ScrapedRecord } from "@supascraper/shared";
-
 import { MAX_DESCRIPTION_LENGTH } from "../../application/add-target/validate-site.js";
+import { formatScore } from "../../domain/health/health-score.js";
 import {
-  isProfiled,
-  tableColumns,
-  type DataContract,
-} from "../../domain/contracts/data-contract.js";
-import type {
-  PipelineStage,
-  PipelineStep,
-} from "../../domain/progress/pipeline-step.js";
-import type { RepairEvent } from "../../domain/repair/repair-event.js";
-import type { OrchestrationState } from "../../domain/state-machine/state-machine.js";
-import { EXPORT_FORMATS, EXPORT_LABELS } from "../export/export-records.js";
+  badgeFor,
+  describeSituation,
+  hostOf,
+  isShowingStaleData,
+  relativeAge,
+  renderContractFields,
+  renderExportChips,
+  renderFeed,
+  renderHealth,
+  renderStatus,
+  stepsToFeed,
+  type DashboardStatus,
+  type TargetStatus,
+} from "./components.js";
+import { escapeHtml, renderPage } from "./layout.js";
 
-export interface TargetStatus {
-  readonly id: string;
-  readonly label: string;
-  readonly collectorId: string;
-  readonly targetUrl: string;
-  readonly controllable: boolean;
-  readonly state: OrchestrationState;
-  readonly records: readonly ScrapedRecord[];
-  readonly collectedAt: string | null;
-  readonly events: readonly RepairEvent[];
-  readonly busy: boolean;
-  readonly lastError: string | null;
-  /** Null until a good run has taught the system this site's shape. */
-  readonly contract: DataContract | null;
-  /** Set while a collector is still being built for a newly added site. */
-  readonly provisioning: string | null;
-  /** What the system is doing, or did, on this attempt. */
-  readonly steps: readonly PipelineStep[];
-}
+export type { DashboardStatus, TargetStatus } from "./components.js";
+export { groupEvents, isShowingStaleData } from "./components.js";
 
-export interface DashboardStatus {
-  readonly configured: boolean;
-  readonly autoHealEnabled: boolean;
-  readonly geminiEnabled: boolean;
-  readonly scheduleMinutes: number | null;
-  readonly targets: readonly TargetStatus[];
-  /** False when no Bright Data CLI is available to build new scrapers. */
-  readonly canAddTargets: boolean;
-  /** True when write endpoints need a bearer token, so the page must ask for one. */
-  readonly requiresToken: boolean;
-}
-
-const HTML_ENTITIES: Readonly<Record<string, string>> = {
-  "&": "&amp;",
-  "<": "&lt;",
-  ">": "&gt;",
-  '"': "&quot;",
-  "'": "&#39;",
-};
-
-function escapeHtml(value: string): string {
-  return value.replaceAll(/[&<>"']/g, (character) => HTML_ENTITIES[character] ?? character);
-}
-
-function relativeAge(timestamp: string | null): string {
-  if (timestamp === null) {
-    return "never";
+/** Fields the contract watches, falling back to what the data actually has. */
+function fieldCount(target: TargetStatus): number {
+  if (target.contract !== null && target.contract.requiredFields.length > 0) {
+    return target.contract.requiredFields.length;
   }
-  const then = Date.parse(timestamp);
-  if (Number.isNaN(then)) {
-    return "unknown";
-  }
-  const seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
-  if (seconds < 60) return `${String(seconds)}s ago`;
-  if (seconds < 3600) return `${String(Math.round(seconds / 60))}m ago`;
-  if (seconds < 86_400) return `${String(Math.round(seconds / 3600))}h ago`;
-  return `${String(Math.round(seconds / 86_400))}d ago`;
+  const first = target.records[0];
+  return first === undefined ? 0 : Object.keys(first).length;
 }
 
-/** States in which the displayed data is current rather than withheld. */
-const CURRENT_DATA_STATES = new Set<OrchestrationState>([
-  "healthy",
-  "recovered",
-  "idle",
-  "running",
-]);
+function renderHero(status: DashboardStatus): string {
+  const cta = status.canAddTargets
+    ? `<div class="actions">
+            <button id="reveal-form" type="button" aria-expanded="false" aria-controls="create-panel">+ Add a website</button>
+          </div>`
+    : `<p class="notice">The Bright Data CLI is not reachable from this process, so new extractors cannot be built.</p>`;
 
-/**
- * True when rows are on screen but the most recent run was not published.
- *
- * Showing last known good data is the correct behaviour; presenting it as
- * current is not. Every non-publishing state must say so.
- */
-export function isShowingStaleData(
-  state: OrchestrationState,
-  hasRecords: boolean,
-): boolean {
-  return hasRecords && !CURRENT_DATA_STATES.has(state);
+  return `      <section class="hero">
+        <p class="eyebrow">Self-healing web intelligence</p>
+        <h1>SupaScraper</h1>
+        <p class="tagline">Your scraper shouldn't break when the web changes.</p>
+        <p class="lede">Describe what you need. SupaScraper builds the extractor, validates the output, detects schema drift, and repairs itself.</p>
+        ${cta}
+        <div class="capabilities">
+          <span class="capability"><span class="dot" aria-hidden="true"></span>Auto-healing</span>
+          <span class="capability"><span class="dot" aria-hidden="true"></span>Data validation</span>
+          <span class="capability"><span class="dot" aria-hidden="true"></span>Schema monitoring</span>
+        </div>
+      </section>`;
 }
 
 /**
- * Text label, a tone, and a glyph.
+ * The create panel, hidden until the hero's call to action reveals it.
  *
- * The palette is monochrome, so tone alone carries almost no signal. Each state
- * therefore ships a word and a shape as well, which is also what keeps it
- * readable for anyone who cannot distinguish the shades.
+ * It starts closed because a large form is the wrong first impression for a
+ * monitoring product: what matters on arrival is the state of what is already
+ * being watched.
  */
-function describeState(
-  state: OrchestrationState,
-): { label: string; tone: string; glyph: string } {
-  switch (state) {
-    case "healthy":
-    case "recovered":
-      return { label: "Healthy", tone: "good", glyph: "●" };
-    case "running":
-    case "verifying":
-      return { label: "Working", tone: "busy", glyph: "◐" };
-    case "healing":
-    case "awaiting_approval":
-      return { label: "Repairing", tone: "warn", glyph: "◑" };
-    case "suspected":
-      return { label: "Break detected", tone: "warn", glyph: "▲" };
-    case "manual_review":
-      return { label: "Needs review", tone: "bad", glyph: "▲" };
-    case "retry_or_wait":
-      return { label: "Waiting to retry", tone: "warn", glyph: "◌" };
-    default:
-      return { label: "Idle", tone: "idle", glyph: "○" };
-  }
-}
-
-const CLASSIFICATION_LABELS: Readonly<Record<string, string>> = {
-  healthy: "Contract satisfied",
-  legitimate_change: "Data changed",
-  structural_break: "Extraction broke",
-  transient_error: "Could not connect",
-  ambiguous: "Needs review",
-};
-
-interface Situation {
-  /** One line saying what the system currently believes. */
-  readonly summary: string;
-  /** What the reader should do, when there is anything to do. */
-  readonly nextStep: string | null;
-}
-
-/**
- * What is happening to this target, in plain language.
- *
- * The diagnosis itself is not recomputed here: the classifier already wrote a
- * human sentence into the run's evidence, and repeating that reasoning in the
- * view would let the two drift apart. This only decides what the reader should
- * do about it.
- */
-function describeSituation(
-  target: TargetStatus,
-  autoHealEnabled: boolean,
-): Situation {
-  if (target.provisioning !== null) {
-    return {
-      summary: target.provisioning,
-      nextStep: "Nothing to do. This page refreshes itself and collects as soon as the scraper exists.",
-    };
-  }
-
-  if (target.busy) {
-    return {
-      summary: "Running the collector, then checking the result against this site's contract.",
-      nextStep: "A repair can take several minutes. This page refreshes on its own.",
-    };
-  }
-
-  if (target.lastError !== null) {
-    return {
-      summary: `The run could not be started: ${target.lastError}`,
-      nextStep: "Check that the Bright Data CLI is authenticated and the collector id still exists.",
-    };
-  }
-
-  const latest = target.events[0];
-
-  if (latest === undefined) {
-    return {
-      summary:
-        target.records.length > 0
-          ? "Holding previously verified data. No run has been recorded since."
-          : "Never collected. Nothing has been verified for this site yet.",
-      nextStep: "Choose Collect now to run it.",
-    };
-  }
-
-  // The first evidence line is the classifier's own explanation of the run.
-  const reason = latest.evidence[0] ?? "No explanation was recorded.";
-
-  switch (latest.classification) {
-    case "healthy":
-      return {
-        summary: `${reason} ${String(target.records.length)} row(s) published.`,
-        nextStep: null,
-      };
-    case "legitimate_change":
-      return {
-        summary: `The page's values changed but its structure held, so the new data was published. ${reason}`,
-        nextStep: null,
-      };
-    case "structural_break":
-      return {
-        summary: `The page still loads, but extraction no longer matches it. ${reason}`,
-        nextStep: autoHealEnabled
-          ? "A repair should start automatically. If this persists, the fix was rejected as implausible."
-          : "Automatic repair is off. Set SUPASCRAPER_AUTO_HEAL=true to let it repair itself, or heal the collector by hand.",
-      };
-    case "transient_error":
-      return {
-        summary: reason,
-        nextStep: "Nothing was repaired, because nothing reached the site. Retry once the connection problem is resolved.",
-      };
-    default:
-      return {
-        summary: reason,
-        nextStep: "The evidence does not support a confident conclusion, so no repair was attempted. The run history below has the detail.",
-      };
-  }
-}
-
-/** Reads a metrics pair as a sentence instead of "0/0 valid". */
-function describeMetrics(event: RepairEvent): string {
-  const phrase = (valid: number, total: number): string => {
-    if (total === 0) return "no rows returned";
-    if (valid === total) return `all ${String(total)} row(s) valid`;
-    return `${String(valid)} of ${String(total)} row(s) valid`;
-  };
-
-  const before = phrase(
-    event.beforeMetrics.validRowCount,
-    event.beforeMetrics.rowCount,
-  );
-
-  if (event.afterMetrics === null) {
-    return before;
-  }
-  return `${before}, then ${phrase(
-    event.afterMetrics.validRowCount,
-    event.afterMetrics.rowCount,
-  )} after the repair`;
-}
-
-const STAGE_LABELS: Readonly<Record<PipelineStage, string>> = {
-  validate: "Check the page and the request",
-  build_scraper: "Build the scraper with Bright Data",
-  collect: "Run the collector",
-  read_output: "Read the output",
-  check_contract: "Check it against the contract",
-  classify: "Decide what happened",
-  learn_contract: "Learn the data contract",
-  publish: "Publish the verified data",
-  heal: "Ask Scraper Studio to repair it",
-  review_fix: "Review the proposed fix",
-  apply_fix: "Approve and save the fix",
-  verify: "Re-run and verify recovery",
-};
-
-const STATUS_MARKS: Readonly<Record<PipelineStep["status"], string>> = {
-  started: "…",
-  done: "✓",
-  failed: "✕",
-  skipped: "–",
-};
-
-const STATUS_WORDS: Readonly<Record<PipelineStep["status"], string>> = {
-  started: "in progress",
-  done: "done",
-  failed: "failed",
-  skipped: "not needed",
-};
-
-/**
- * Shows the steps taken on this attempt, in order.
- *
- * This is the answer to "what is it actually doing". A collector build runs for
- * minutes and a repair longer still, so without this the page could only show a
- * spinner and then a verdict.
- */
-function renderSteps(steps: readonly PipelineStep[]): string {
-  if (steps.length === 0) {
-    return `<p class="muted small">Nothing has run yet. The steps appear here as they happen.</p>`;
-  }
-
-  const items = steps
-    .map((step) => {
-      const label = STAGE_LABELS[step.stage] ?? step.stage;
-      return `<li class="step ${step.status}">
-              <span class="mark" aria-hidden="true">${STATUS_MARKS[step.status]}</span>
-              <span class="step-body">
-                <span class="step-name">${escapeHtml(label)}</span>
-                <span class="muted small step-status"> &mdash; ${STATUS_WORDS[step.status]}</span>
-                <span class="muted small step-detail">${escapeHtml(step.detail)}</span>
-              </span>
-              <span class="muted small step-time">${escapeHtml(relativeAge(step.at))}</span>
-            </li>`;
-    })
-    .join("\n");
-
-  return `<ol class="steps">
-${items}
-          </ol>`;
-}
-
-const MAX_CELL_LENGTH = 90;
-
-/** Renders any scraped value as a table cell, whatever its type. */
-function renderCell(value: unknown): string {
-  if (value === null || value === undefined) {
-    return `<td class="muted">&mdash;</td>`;
-  }
-  if (typeof value === "number") {
-    return `<td class="num">${escapeHtml(String(value))}</td>`;
-  }
-  if (typeof value === "boolean") {
-    return `<td>${value ? "yes" : "no"}</td>`;
-  }
-
-  const text = typeof value === "string" ? value : JSON.stringify(value);
-  const shown =
-    text.length > MAX_CELL_LENGTH ? `${text.slice(0, MAX_CELL_LENGTH - 1)}…` : text;
-
-  if (/^https?:\/\/\S+$/.test(text)) {
-    return `<td><a href="${escapeHtml(text)}" rel="noreferrer noopener nofollow" target="_blank">${escapeHtml(
-      shown,
-    )}</a></td>`;
-  }
-  return `<td>${escapeHtml(shown.replaceAll("_", " "))}</td>`;
-}
-
-const MAX_VISIBLE_ROWS = 25;
-
-function renderRows(
-  records: readonly ScrapedRecord[],
-  columns: readonly string[],
-): string {
-  const span = Math.max(1, columns.length);
-
-  if (columns.length === 0 || records.length === 0) {
-    return `<tr><td colspan="${String(span)}" class="muted">No verified data collected yet.</td></tr>`;
-  }
-
-  const rows = records
-    .slice(0, MAX_VISIBLE_ROWS)
-    .map(
-      (record) =>
-        `<tr>${columns.map((column) => renderCell(record[column])).join("")}</tr>`,
-    );
-
-  if (records.length > MAX_VISIBLE_ROWS) {
-    rows.push(
-      `<tr><td colspan="${String(span)}" class="muted small">and ${String(
-        records.length - MAX_VISIBLE_ROWS,
-      )} more row(s) &mdash; download the full set below.</td></tr>`,
-    );
-  }
-
-  return rows.join("\n");
-}
-
-/** Shows the contract the site is being held to, so the guarantee is visible. */
-function renderContract(contract: DataContract | null): string {
-  if (contract === null || !isProfiled(contract)) {
-    return `<p class="muted small">No contract learned yet. The first successful run defines one.</p>`;
-  }
-
-  const fields =
-    contract.requiredFields.length === 0
-      ? "<em>none</em>"
-      : contract.requiredFields
-          .map(
-            (field) =>
-              `<code>${escapeHtml(field)}</code>${
-                contract.fieldTypes[field] === undefined
-                  ? ""
-                  : `<span class="muted small">:${escapeHtml(String(contract.fieldTypes[field]))}</span>`
-              }`,
-          )
-          .join(" ");
-
-  return `<details class="contract">
-            <summary>Learned data contract</summary>
-            <p class="small">Every run must return ${escapeHtml(
-              String(contract.minimumRows),
-            )}&ndash;${escapeHtml(String(contract.maximumRows))} rows with these fields present and non-empty:</p>
-            <p class="small fields">${fields}</p>
-            <p class="muted small">${
-              contract.identityField === null
-                ? "No unique identifier was found, so rows are compared whole."
-                : `Rows are identified by <code>${escapeHtml(contract.identityField)}</code>.`
-            } Learned ${escapeHtml(relativeAge(contract.profiledAt))}.</p>
-          </details>`;
-}
-
-function renderExports(target: TargetStatus): string {
-  if (target.records.length === 0) {
+function renderCreatePanel(status: DashboardStatus): string {
+  if (!status.canAddTargets) {
     return "";
   }
 
-  const links = EXPORT_FORMATS.map(
-    (format) =>
-      `<a class="chip" download href="/api/targets/${encodeURIComponent(
-        target.id,
-      )}/export?format=${format}">${escapeHtml(EXPORT_LABELS[format])}</a>`,
-  ).join("\n            ");
-
-  return `<div class="block">
-            <h3>Download ${String(target.records.length)} verified record(s)</h3>
-            <div class="chips">
-            ${links}
-            </div>
-          </div>`;
-}
-
-/**
- * Collapses a repeated identical outcome into one entry with a count.
- *
- * Three consecutive runs failing the same way is one fact, not three. Listing it
- * three times pushed everything useful off the screen.
- */
-interface TimelineEntry {
-  readonly event: RepairEvent;
-  readonly repeats: number;
-  readonly oldestAt: string;
-}
-
-export function groupEvents(events: readonly RepairEvent[]): TimelineEntry[] {
-  const grouped: TimelineEntry[] = [];
-
-  for (const event of events) {
-    const last = grouped.at(-1);
-    const sameOutcome =
-      last !== undefined &&
-      last.event.classification === event.classification &&
-      last.event.state === event.state &&
-      last.event.evidence.join("|") === event.evidence.join("|");
-
-    if (sameOutcome && last !== undefined) {
-      grouped[grouped.length - 1] = {
-        event: last.event,
-        repeats: last.repeats + 1,
-        oldestAt: event.createdAt,
-      };
-      continue;
-    }
-    grouped.push({ event, repeats: 1, oldestAt: event.createdAt });
-  }
-
-  return grouped;
-}
-
-function renderTimeline(events: readonly RepairEvent[]): string {
-  if (events.length === 0) {
-    return `<li class="muted">No runs recorded yet.</li>`;
-  }
-
-  return groupEvents(events)
-    .map((entry) => {
-      const { event, repeats } = entry;
-      const label = CLASSIFICATION_LABELS[event.classification] ?? event.classification;
-      const verified =
-        event.verification === "not_started"
-          ? ""
-          : `<span class="badge">${
-              event.verification === "passed" ? "Verified recovered" : "Verification failed"
-            }</span>`;
-      const count =
-        repeats > 1
-          ? `<span class="badge">${String(repeats)} runs, same outcome</span>`
-          : "";
-      const when =
-        repeats > 1
-          ? `${escapeHtml(relativeAge(entry.oldestAt))} &ndash; ${escapeHtml(relativeAge(event.createdAt))}`
-          : escapeHtml(relativeAge(event.createdAt));
-
-      // The first line is already the headline, so only the remaining evidence
-      // is listed here.
-      const evidence = event.evidence
-        .slice(1, 3)
-        .map((line) => `<li>${escapeHtml(line)}</li>`)
-        .join("");
-
-      const prompt =
-        event.healPrompt === null
-          ? ""
-          : `<details><summary>Repair instruction sent to Scraper Studio</summary><p class="prompt">${escapeHtml(event.healPrompt)}</p></details>`;
-
-      return `<li class="event ${event.classification}">
-                <div class="event-head">
-                  <span class="pill">${escapeHtml(label)}</span>
-                  ${verified}
-                  ${count}
-                  <span class="muted small spacer">${when}</span>
-                </div>
-                <p class="small">${escapeHtml(event.evidence[0] ?? "No explanation was recorded.")}</p>
-                ${evidence === "" ? "" : `<ul class="evidence">${evidence}</ul>`}
-                <p class="muted small">${escapeHtml(describeMetrics(event))}</p>
-                ${prompt}
-              </li>`;
-    })
-    .join("\n");
-}
-
-function renderTarget(target: TargetStatus, autoHealEnabled: boolean): string {
-  const state = describeState(target.state);
-  const stale = isShowingStaleData(target.state, target.records.length > 0);
-  const columns = tableColumns(target.contract, target.records);
-  const provisioning = target.provisioning !== null;
-  const situation = describeSituation(target, autoHealEnabled);
-  const shown = provisioning
-    ? { label: "Building scraper", tone: "busy", glyph: "◐" }
-    : state;
-
-  const host = (() => {
-    try {
-      return new URL(target.targetUrl).host;
-    } catch {
-      return target.targetUrl;
-    }
-  })();
-
-  const head = columns
-    .map((column) => `<th scope="col">${escapeHtml(column.replaceAll("_", " "))}</th>`)
-    .join("");
-
-  return `      <section class="target" aria-labelledby="t-${escapeHtml(target.id)}">
-        <div class="target-head">
-          <div>
-            <h2 id="t-${escapeHtml(target.id)}">${escapeHtml(target.label)}</h2>
-            <p class="muted small">
-              <a href="${escapeHtml(target.targetUrl)}" rel="noreferrer noopener nofollow" target="_blank">${escapeHtml(host)}</a>
-              &middot; <code>${escapeHtml(target.collectorId)}</code>
-              &middot; ${target.controllable ? "layout switchable" : "site we do not control"}
-            </p>
-          </div>
-          <div class="value state ${shown.tone}" role="status" aria-live="polite"><span class="glyph" aria-hidden="true">${shown.glyph}</span>${escapeHtml(shown.label)}</div>
-        </div>
-
-        <div class="situation">
-          <p>${escapeHtml(situation.summary)}</p>
-          ${situation.nextStep === null ? "" : `<p class="muted small">${escapeHtml(situation.nextStep)}</p>`}
-        </div>
-
-        <div class="grid">
-          <div><div class="label">Last verified</div><div class="value">${escapeHtml(relativeAge(target.collectedAt))}</div></div>
-          <div><div class="label">Verified records</div><div class="value num">${String(target.records.length)}</div></div>
-          <div><div class="label">Runs recorded</div><div class="value num">${String(target.events.length)}</div></div>
-        </div>
-
-        ${stale ? `<p class="notice">Showing the last verified data. The most recent run did not satisfy the contract, so its output was withheld.</p>` : ""}
-
-        <div class="actions">
-          <button data-target="${escapeHtml(target.id)}" ${target.busy || provisioning ? "disabled" : ""}>${target.busy ? "Collecting..." : "Collect now"}</button>
-          <span class="muted small">${
-            provisioning
-              ? "Available once the scraper is built."
-              : "Runs the collector once and validates the result."
-          }</span>
-        </div>
-
-        <div class="block">
-          <h3>What the scraper is doing</h3>
-          ${renderSteps(target.steps)}
-        </div>
-
-        <div class="block">
-          <h3>Verified data</h3>
-          <table>
-            <caption>Only output that satisfied the contract appears here.</caption>
-            <thead><tr>${head.length > 0 ? head : `<th scope="col">Data</th>`}</tr></thead>
-            <tbody>
-${renderRows(target.records, columns)}
-            </tbody>
-          </table>
-        </div>
-
-        ${renderExports(target)}
-
-        <div class="block">
-          <h3>Contract</h3>
-          ${renderContract(target.contract)}
-        </div>
-
-        <div class="block">
-          <h3>Run history</h3>
-          <ul class="timeline">
-${renderTimeline(target.events)}
-          </ul>
-        </div>
-      </section>`;
-}
-
-function renderAddForm(status: DashboardStatus): string {
-  if (!status.canAddTargets) {
-    return `      <section><p class="notice">Adding sites needs the Bright Data CLI to be reachable from this process.</p></section>`;
-  }
-
-  return `      <section aria-labelledby="add-heading">
-        <h2 id="add-heading">Add a website</h2>
-        <p class="muted small">Bright Data's AI builds a scraper from your description. This takes roughly 5 to 10 minutes, and everything else keeps running while it works.</p>
+  return `      <section class="panel" id="create-panel" aria-labelledby="create-heading" hidden>
+        <h2 id="create-heading">Create a scraper</h2>
         <form id="add-form">
-          <div class="field">
-            <label for="add-url">Page URL</label>
-            <input id="add-url" name="url" type="url" required placeholder="https://example.com/products"
-                   inputmode="url" autocomplete="off">
-            <p class="muted small">Must be a public HTTPS page. Scrape only data you are permitted to collect.</p>
+          <div class="two-col">
+            <div>
+              <label for="add-url">Website URL</label>
+              <input id="add-url" name="url" type="url" required inputmode="url"
+                     autocomplete="off" placeholder="https://github.com/trending">
+              <p class="hint">A public HTTPS page. Scrape only data you are permitted to collect.</p>
+            </div>
+            <div>
+              <label for="add-description">What do you need?</label>
+              <textarea id="add-description" name="description" required rows="3"
+                        maxlength="${String(MAX_DESCRIPTION_LENGTH)}"
+                        placeholder="Extract repository name, stars, forks, language and URL."></textarea>
+              <p class="hint">Plain language. Name the fields; Bright Data works out the markup.</p>
+            </div>
           </div>
-          <div class="field">
-            <label for="add-description">What should be extracted?</label>
-            <textarea id="add-description" name="description" required rows="3"
-                      maxlength="${String(MAX_DESCRIPTION_LENGTH)}"
-                      placeholder="For each product card, extract the title, price as a number, rating, and product link."></textarea>
-            <p class="muted small">Plain language. Name the fields you want; Bright Data works out the markup.</p>
+          <div>
+            <label for="add-label">Name <span class="muted">(optional)</span></label>
+            <input id="add-label" name="label" type="text" maxlength="60" placeholder="Open Source Radar">
           </div>
-          <div class="field">
-            <label for="add-label">Display name <span class="muted">(optional)</span></label>
-            <input id="add-label" name="label" type="text" maxlength="60" placeholder="Example shop">
-          </div>
-          <div class="actions">
-            <button type="submit">Build scraper</button>
-            <span id="add-status" class="muted small" role="status" aria-live="polite"></span>
+          <div class="form-foot">
+            <span id="add-status" class="hint" role="status" aria-live="polite">Building takes 5 to 10 minutes. Everything else keeps running.</span>
+            <button type="submit">Build intelligent scraper</button>
           </div>
         </form>
       </section>`;
+}
+
+function renderFleetStats(status: DashboardStatus): string {
+  const scored = status.targets
+    .map((target) => target.health.overall)
+    .filter((score): score is number => score !== null);
+
+  const fleetHealth =
+    scored.length === 0
+      ? null
+      : scored.reduce((total, score) => total + score, 0) / scored.length;
+
+  const records = status.targets.reduce(
+    (total, target) => total + target.records.length,
+    0,
+  );
+  const fields = status.targets.reduce(
+    (total, target) => total + fieldCount(target),
+    0,
+  );
+  const repairs = status.targets.reduce(
+    (total, target) =>
+      total + target.events.filter((event) => event.verification === "passed").length,
+    0,
+  );
+
+  return `      <section class="panel">
+        <div class="tiles">
+          <div class="tile"><div class="figure">${String(status.targets.length)}</div><div class="caption">scrapers</div></div>
+          <div class="tile accent"><div class="figure">${formatScore(fleetHealth)}</div><div class="caption">fleet health</div></div>
+          <div class="tile"><div class="figure">${String(records)}</div><div class="caption">records</div></div>
+          <div class="tile"><div class="figure">${String(fields)}</div><div class="caption">fields monitored</div></div>
+          <div class="tile"><div class="figure">${String(repairs)}</div><div class="caption">self-repairs</div></div>
+        </div>
+      </section>`;
+}
+
+function renderCard(target: TargetStatus, autoHealEnabled: boolean): string {
+  const badge = badgeFor(target);
+  const situation = describeSituation(target, autoHealEnabled);
+  const stale = isShowingStaleData(target.state, target.records.length > 0);
+  const provisioning = target.provisioning !== null;
+  const detail = `/scrapers/${encodeURIComponent(target.id)}`;
+  const drift = target.events.filter(
+    (event) => event.classification === "structural_break",
+  ).length;
+
+  return `        <article class="card" aria-labelledby="s-${escapeHtml(target.id)}">
+          <div class="card-top">
+            <div>
+              ${renderStatus(badge)}
+              <h2 id="s-${escapeHtml(target.id)}" style="margin-top:.5rem"><a href="${detail}">${escapeHtml(target.label)}</a></h2>
+              <p class="host">${escapeHtml(hostOf(target.targetUrl))} &middot; <code>${escapeHtml(target.collectorId)}</code></p>
+            </div>
+            <a class="open" href="${detail}">Open &rarr;</a>
+          </div>
+
+          <p class="small" style="margin-top:.85rem">${escapeHtml(situation.summary)}</p>
+          ${situation.nextStep === null ? "" : `<p class="hint">${escapeHtml(situation.nextStep)}</p>`}
+          ${stale ? `<p class="notice">Showing the last verified data. The most recent scrape did not satisfy the contract, so its output was withheld.</p>` : ""}
+
+          <div class="split">
+            <div>
+              <div class="tiles">
+                <div class="tile"><div class="figure">${String(target.records.length)}</div><div class="caption">records</div></div>
+                <div class="tile"><div class="figure">${String(fieldCount(target))}</div><div class="caption">fields</div></div>
+                <div class="tile"><div class="figure">${formatScore(target.health.extraction)}</div><div class="caption">valid</div></div>
+                <div class="tile"><div class="figure" style="font-size:1.05rem">${escapeHtml(relativeAge(target.collectedAt))}</div><div class="caption">last scrape</div></div>
+              </div>
+
+              <div style="margin-top:1.1rem">
+                <h3>Data contract</h3>
+                ${renderContractFields(target.contract)}
+              </div>
+
+              <div style="margin-top:1.1rem">
+                <h3>Activity</h3>
+                ${renderFeed(stepsToFeed(target.steps).slice(-6), "Nothing has run yet. Steps appear here as they happen.")}
+              </div>
+            </div>
+            ${renderHealth(target)}
+          </div>
+
+          <div class="form-foot">
+            <span class="hint">Schema drift events: <strong>${String(drift)}</strong> &middot; scrapes recorded: <strong>${String(target.events.length)}</strong></span>
+            <span class="actions" style="margin:0">
+              <button data-target="${escapeHtml(target.id)}" ${target.busy || provisioning ? "disabled" : ""}>${target.busy ? "Scraping..." : "Scrape now"}</button>
+              <a class="btn btn-quiet" href="${detail}">Details</a>
+            </span>
+          </div>
+
+          ${target.records.length === 0 ? "" : `<div style="margin-top:1rem"><h3>Download</h3>${renderExportChips(target)}</div>`}
+        </article>`;
 }
 
 export function renderDashboardPage(status: DashboardStatus): string {
   const busy = status.targets.some(
     (target) => target.busy || target.provisioning !== null,
   );
-
-  // Refresh faster while a step is actually mid-flight, so the sequence reads as
-  // it happens rather than arriving in one jump.
   const stepInFlight = status.targets.some((target) =>
     target.steps.some((step) => step.status === "started"),
   );
-  const refreshSeconds = stepInFlight ? 6 : 15;
-  const modes = [
-    status.autoHealEnabled ? "auto-repair on" : "auto-repair off",
-    status.geminiEnabled ? "Gemini on" : "Gemini off",
-    status.scheduleMinutes === null
-      ? "no schedule"
-      : `every ${String(status.scheduleMinutes)} min`,
-  ].join(" &middot; ");
 
-  return `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    ${busy ? `<meta http-equiv="refresh" content="${String(refreshSeconds)}">` : ""}
-    <title>SupaScraper${busy ? " — working" : ""}</title>
-    <style>
-      :root { color-scheme: light;
-        --paper:#ffffff; --ink:#000000; --ink-2:#2b2b2b; --ink-3:#5c5c5c;
-        --line:#d9d9d9; --line-strong:#000000; --wash:#fafafa; --wash-2:#f2f2f2; }
-      * { box-sizing:border-box; }
-      body { margin:0; background:var(--paper); color:var(--ink);
-        font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; line-height:1.55;
-        -webkit-font-smoothing:antialiased; }
-      main { width:min(100% - 2rem, 70rem); margin:0 auto; padding:2.5rem 0 4rem; }
-      header { background:var(--ink); color:var(--paper); border-radius:.5rem;
-        padding:1.5rem 1.6rem; margin-bottom:1.25rem; }
-      header a { color:var(--paper); }
-      header .label, header .muted { color:#c9c9c9; }
-      section { background:var(--paper); border:1px solid var(--line);
-        border-radius:.5rem; padding:1.35rem 1.5rem; margin-bottom:1.25rem; }
-      h1 { margin:.25rem 0 .5rem; font-size:1.9rem; letter-spacing:-.025em; font-weight:750; }
-      h2 { font-size:1.15rem; margin:0; letter-spacing:-.01em; }
-      h3 { font-size:.72rem; text-transform:uppercase; letter-spacing:.09em;
-        color:var(--ink-3); margin:0 0 .55rem; font-weight:700; }
-      p { margin:.35rem 0; }
-      a { color:var(--ink); text-underline-offset:2px; }
-      .label { color:var(--ink-3); font-size:.68rem; letter-spacing:.09em;
-        text-transform:uppercase; font-weight:700; }
-      .value { font-weight:650; margin-top:.15rem; overflow-wrap:anywhere; }
-      .muted { color:var(--ink-3); } .small { font-size:.83rem; }
-      .num { font-variant-numeric:tabular-nums; }
-      code { background:var(--wash-2); border:1px solid var(--line);
-        padding:.05rem .34rem; border-radius:.25rem; font-size:.85em; }
+  const cards =
+    status.targets.length === 0
+      ? `      <section class="panel"><div class="empty">
+          <strong>No scrapers yet</strong>
+          Add a website above. SupaScraper builds the extractor and learns what its data should look like.
+        </div></section>`
+      : `      <section>
+        <div class="cards">
+${status.targets.map((target) => renderCard(target, status.autoHealEnabled)).join("\n")}
+        </div>
+      </section>`;
 
-      .target-head { display:flex; gap:1rem; align-items:flex-start;
-        justify-content:space-between; flex-wrap:wrap;
-        border-bottom:1px solid var(--line); padding-bottom:.9rem; }
+  return renderPage({
+    title: `SupaScraper${busy ? " — working" : ""}`,
+    nav: "dashboard",
+    refreshSeconds: busy ? (stepInFlight ? 6 : 15) : null,
+    requiresToken: status.requiresToken,
+    canAddTargets: status.canAddTargets,
+    body: `${renderHero(status)}
 
-      /* Status is carried by a word and a shape. The shades only reinforce it,
-         so nothing is lost when they cannot be told apart. */
-      .state { display:inline-flex; align-items:center; gap:.45rem; font-weight:700;
-        white-space:nowrap; font-size:.92rem; padding:.25rem .6rem; border-radius:999px;
-        border:1px solid var(--line-strong); }
-      .state .glyph { font-size:.8rem; line-height:1; }
-      .state.bad, .state.warn { background:var(--ink); color:var(--paper); }
-      .state.good { background:var(--paper); color:var(--ink); }
-      .state.busy { background:var(--wash-2); color:var(--ink); }
-      .state.idle { background:var(--paper); color:var(--ink-3); border-color:var(--line); }
-      .state.busy .glyph { animation:spin 1.6s linear infinite; }
-      @keyframes spin { to { transform:rotate(360deg) } }
-      @media (prefers-reduced-motion:reduce) { .state.busy .glyph{animation:none} }
+${renderCreatePanel(status)}
 
-      .situation { border-left:3px solid var(--ink); padding:.15rem 0 .15rem .85rem;
-        margin:1rem 0 .25rem; }
-      .situation p:first-child { font-weight:600; }
+${renderFleetStats(status)}
 
-      .grid { display:grid; gap:1rem; grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));
-        margin-top:1.15rem; padding-top:1rem; border-top:1px solid var(--line); }
-
-      .block { margin-top:1.6rem; }
-      table { border-collapse:collapse; width:100%; display:block; overflow-x:auto; }
-      caption { text-align:left; color:var(--ink-3); font-size:.79rem; padding-bottom:.45rem; }
-      th, td { text-align:left; padding:.5rem .55rem; border-bottom:1px solid var(--line);
-        max-width:22rem; overflow-wrap:anywhere; }
-      th { color:var(--ink-3); font-size:.68rem; text-transform:uppercase;
-        letter-spacing:.07em; white-space:nowrap; border-bottom:1px solid var(--ink); font-weight:700; }
-      tbody tr:last-child td { border-bottom:none; }
-
-      ul.timeline { list-style:none; margin:0; padding:0; display:grid; gap:1rem; }
-      .event { border-left:2px solid var(--line); padding:.1rem 0 .1rem .85rem; }
-      .event.structural_break, .event.ambiguous, .event.transient_error {
-        border-left-color:var(--ink); border-left-width:3px; }
-      .event-head { display:flex; gap:.45rem; align-items:center; flex-wrap:wrap; }
-      .spacer { margin-left:auto; }
-      .pill { background:var(--ink); color:var(--paper); border-radius:999px;
-        padding:.1rem .6rem; font-size:.73rem; font-weight:700; }
-      .badge { border:1px solid var(--line-strong); border-radius:.25rem;
-        padding:.05rem .4rem; font-size:.7rem; font-weight:650; }
-      ul.evidence { margin:.35rem 0 .3rem; padding-left:1.05rem; color:var(--ink-3);
-        font-size:.83rem; }
-      .prompt { background:var(--wash); border:1px solid var(--line); border-radius:.35rem;
-        padding:.6rem .7rem; font-size:.82rem; color:var(--ink-2); }
-      details summary { cursor:pointer; color:var(--ink-3); font-size:.8rem;
-        margin-top:.3rem; font-weight:600; }
-      .contract .fields { display:flex; flex-wrap:wrap; gap:.35rem; }
-
-      ol.steps { list-style:none; margin:0; padding:0; display:grid; gap:.1rem;
-        counter-reset:step; }
-      .step { display:grid; grid-template-columns:1.4rem 1fr auto; gap:.55rem;
-        align-items:baseline; padding:.42rem .5rem; border-bottom:1px solid var(--line); }
-      .step:last-child { border-bottom:none; }
-      .step .mark { font-weight:800; text-align:center; }
-      .step-name { font-weight:650; font-size:.88rem; }
-      .step-detail { display:block; }
-      .step-time { white-space:nowrap; }
-      .step.started { background:var(--wash-2); }
-      .step.started .mark { animation:blink 1.2s steps(3,end) infinite; }
-      .step.skipped .step-name { font-weight:500; color:var(--ink-3); }
-      .step.failed { background:var(--wash); }
-      .step.failed .step-name { text-decoration:underline; text-decoration-thickness:2px; }
-      @keyframes blink { 50% { opacity:.25 } }
-      @media (prefers-reduced-motion:reduce) { .step.started .mark{animation:none} }
-
-      .notice { border:1px solid var(--ink); border-left-width:3px; background:var(--wash);
-        padding:.6rem .8rem; border-radius:.35rem; margin-top:1rem; font-size:.86rem; }
-
-      button { font:inherit; font-weight:650; color:var(--paper); background:var(--ink);
-        border:1px solid var(--ink); border-radius:.35rem; padding:.5rem 1rem; cursor:pointer; }
-      button:hover:not(:disabled) { background:var(--ink-2); }
-      button:disabled { background:var(--paper); color:var(--ink-3);
-        border-color:var(--line); cursor:not-allowed; }
-      :focus-visible { outline:2px solid var(--ink); outline-offset:2px; }
-      .actions { margin-top:1.1rem; display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
-
-      .chips { display:flex; flex-wrap:wrap; gap:.4rem; }
-      .chip { display:inline-block; background:var(--paper); border:1px solid var(--ink);
-        border-radius:.3rem; padding:.28rem .65rem; font-size:.8rem; font-weight:650;
-        text-decoration:none; color:var(--ink); }
-      .chip:hover { background:var(--ink); color:var(--paper); }
-
-      .field { margin-top:.9rem; max-width:44rem; }
-      label { display:block; font-size:.8rem; font-weight:700; margin-bottom:.28rem; }
-      input, textarea { font:inherit; width:100%; background:var(--paper); color:var(--ink);
-        border:1px solid var(--line-strong); border-radius:.35rem; padding:.5rem .6rem; }
-      textarea { resize:vertical; }
-      ::placeholder { color:#9a9a9a; }
-    </style>
-  </head>
-  <body>
-    <main>
-      <header>
-        <p class="label">Self-healing data contract guardian</p>
-        <h1>SupaScraper</h1>
-        <p class="muted">Add any public page. SupaScraper learns the shape of its data, watches for the day extraction breaks, repairs itself, and never publishes data it could not verify.</p>
-        <p class="muted small">${modes}</p>
-      </header>
-
-${renderAddForm(status)}
-
-${
-  status.configured
-    ? status.targets
-        .map((target) => renderTarget(target, status.autoHealEnabled))
-        .join("\n")
-    : `      <section><p class="notice">No sites yet. Add one above, or configure <code>SUPASCRAPER_TARGETS_PATH</code>.</p></section>`
-}
-    </main>
-    <script>
-      const REQUIRES_TOKEN = ${status.requiresToken ? "true" : "false"};
-      const KEY = "supascraper-token";
-
-      function headers() {
-        const token = sessionStorage.getItem(KEY);
-        return token ? { authorization: "Bearer " + token } : {};
-      }
-
-      function askForToken(force) {
-        if (!REQUIRES_TOKEN) return true;
-        if (!force && sessionStorage.getItem(KEY)) return true;
-        const token = window.prompt("This deployment is protected. Enter the API token to continue:");
-        if (!token) return false;
-        sessionStorage.setItem(KEY, token.trim());
-        return true;
-      }
-
-      async function send(url, options) {
-        if (!askForToken(false)) throw new Error("An API token is required.");
-        let response = await fetch(url, {
-          ...options,
-          headers: { ...(options.headers || {}), ...headers() },
-        });
-        if (response.status === 401) {
-          sessionStorage.removeItem(KEY);
-          if (!askForToken(true)) throw new Error("An API token is required.");
-          response = await fetch(url, {
-            ...options,
-            headers: { ...(options.headers || {}), ...headers() },
-          });
-        }
-        if (!response.ok) {
-          const body = await response.json().catch(() => ({}));
-          throw new Error(body.error || "HTTP " + response.status);
-        }
-        return response.json().catch(() => ({}));
-      }
-
-      for (const button of document.querySelectorAll("button[data-target]")) {
-        button.addEventListener("click", async () => {
-          const id = button.getAttribute("data-target");
-          const original = button.textContent;
-          button.disabled = true;
-          button.textContent = "Collecting...";
-          try {
-            await send("/api/run?target=" + encodeURIComponent(id), { method: "POST" });
-            setTimeout(() => { window.location.reload(); }, 1500);
-          } catch (error) {
-            button.disabled = false;
-            button.textContent = original;
-            window.alert("Could not start a run: " + error.message);
-          }
-        });
-      }
-
-      const form = document.getElementById("add-form");
-      if (form) {
-        const note = document.getElementById("add-status");
-        form.addEventListener("submit", async (event) => {
-          event.preventDefault();
-          const button = form.querySelector("button[type=submit]");
-          const data = new FormData(form);
-          button.disabled = true;
-          note.textContent = "Asking Bright Data to build a scraper. This can take 5 to 10 minutes.";
-          try {
-            await send("/api/targets", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({
-                url: data.get("url"),
-                description: data.get("description"),
-                label: data.get("label") || undefined,
-              }),
-            });
-            note.textContent = "Building. This page will keep refreshing.";
-            form.reset();
-            setTimeout(() => { window.location.reload(); }, 2000);
-          } catch (error) {
-            button.disabled = false;
-            note.textContent = "";
-            window.alert("Could not add that site: " + error.message);
-          }
-        });
-      }
-    </script>
-  </body>
-</html>`;
+${cards}`,
+  });
 }

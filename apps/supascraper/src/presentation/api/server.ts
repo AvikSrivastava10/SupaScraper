@@ -18,16 +18,28 @@ import { runCollector } from "../../application/run-collector/run-collector.js";
 import { isLoopbackHost, type AppConfig } from "../../config/config.js";
 import type { TargetConfig } from "../../config/targets.js";
 import { orderedFields } from "../../domain/contracts/data-contract.js";
+import { scoreHealth, UNKNOWN_HEALTH } from "../../domain/health/health-score.js";
 import type { GeminiReasoner } from "../../infrastructure/gemini/gemini-adapter.js";
 import type { Logger } from "../../infrastructure/logging/logger.js";
 import type { DashboardDataReader } from "../../infrastructure/persistence/in-memory-repository.js";
 import { InMemoryActivityLog } from "../../infrastructure/persistence/activity-log.js";
 import { exportRecords, isExportFormat, EXPORT_FORMATS } from "../export/export-records.js";
+import type {
+  DashboardStatus,
+  TargetStatus,
+} from "../web/components.js";
+import { renderDashboardPage } from "../web/dashboard-page.js";
 import {
-  renderDashboardPage,
-  type DashboardStatus,
-  type TargetStatus,
-} from "../web/dashboard-page.js";
+  renderActivityPage,
+  renderDataPage,
+  renderScrapersPage,
+  renderSettingsPage,
+} from "../web/list-pages.js";
+import {
+  isScraperTab,
+  renderScraperPage,
+  type ScraperTab,
+} from "../web/scraper-page.js";
 
 export interface ApplicationDependencies {
   readonly repository: DashboardDataReader & ScrapedDataStore & RepairEventStore;
@@ -104,6 +116,24 @@ function readOptionalString(value: unknown): string | undefined {
 }
 
 const EXPORT_ROUTE = /^\/api\/targets\/([^/]+)\/export$/;
+const SCRAPER_ROUTE = /^\/scrapers\/([^/]+)$/;
+
+/** Server-rendered pages, each taking the same status snapshot. */
+const PAGE_ROUTES = new Map<string, (status: DashboardStatus) => string>([
+  ["/", renderDashboardPage],
+  ["/scrapers", renderScrapersPage],
+  ["/activity", renderActivityPage],
+  ["/data", renderDataPage],
+  ["/settings", renderSettingsPage],
+]);
+
+function writeHtml(response: ServerResponse, statusCode: number, html: string): void {
+  response.writeHead(statusCode, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  response.end(html);
+}
 
 export function createApplicationServer(
   config: AppConfig,
@@ -143,15 +173,20 @@ export function createApplicationServer(
       repository.getContract(target.collectorId),
     ]);
 
-    const recent = [...events].reverse().slice(0, 6);
+    const recent = [...events].reverse().slice(0, 12);
     const latest = recent[0];
     const busy = active.has(target.id);
+    const scheduleMinutes =
+      config.scheduleIntervalMs === null
+        ? null
+        : Math.round(config.scheduleIntervalMs / 60_000);
 
     return {
       id: target.id,
       label: target.label,
       collectorId: target.collectorId,
       targetUrl: target.targetUrl,
+      fieldDescription: target.fieldDescription,
       controllable: target.controllable,
       state: busy ? "running" : (latest?.state ?? (snapshot ? "healthy" : "idle")),
       records: snapshot?.records ?? [],
@@ -162,6 +197,14 @@ export function createApplicationServer(
       contract,
       provisioning: null,
       steps: activity.list(target.id),
+      // Scored from the most recent recorded run. A target with no runs scores
+      // nothing rather than defaulting to a flattering figure.
+      health: scoreHealth({
+        metrics: latest?.beforeMetrics ?? null,
+        contract,
+        collectedAt: snapshot?.collectedAt ?? null,
+        scheduleMinutes,
+      }),
     };
   };
 
@@ -172,6 +215,7 @@ export function createApplicationServer(
       label: entry.label,
       collectorId: "not built yet",
       targetUrl: entry.targetUrl,
+      fieldDescription: entry.fieldDescription,
       controllable: false,
       state: "idle" as const,
       records: [],
@@ -183,8 +227,9 @@ export function createApplicationServer(
       provisioning:
         entry.status === "failed"
           ? null
-          : "Bright Data is building a scraper for this page. This usually takes 5 to 10 minutes.",
+          : "Bright Data is building the extractor for this page. This usually takes 5 to 10 minutes.",
       steps: activity.list(entry.id),
+      health: UNKNOWN_HEALTH,
     }));
 
   const buildStatus = async (): Promise<DashboardStatus> => {
@@ -502,12 +547,33 @@ export function createApplicationServer(
         return;
       }
 
-      if (request.method === "GET" && url.pathname === "/") {
-        response.writeHead(200, {
-          "content-type": "text/html; charset=utf-8",
-          "cache-control": "no-store",
-        });
-        response.end(renderDashboardPage(await buildStatus()));
+      if (request.method === "GET" && PAGE_ROUTES.has(url.pathname)) {
+        const status = await buildStatus();
+        const render = PAGE_ROUTES.get(url.pathname);
+        writeHtml(response, 200, render?.(status) ?? "");
+        return;
+      }
+
+      // A single scraper, with its tab chosen by query string so the whole page
+      // stays server-rendered and linkable.
+      const scraperMatch = SCRAPER_ROUTE.exec(url.pathname);
+      if (request.method === "GET" && scraperMatch?.[1] !== undefined) {
+        const wanted = decodeURIComponent(scraperMatch[1]);
+        const status = await buildStatus();
+        const target = status.targets.find((candidate) => candidate.id === wanted);
+
+        if (target === undefined) {
+          writeHtml(
+            response,
+            404,
+            renderScrapersPage(status),
+          );
+          return;
+        }
+
+        const requestedTab = url.searchParams.get("tab") ?? "overview";
+        const tab: ScraperTab = isScraperTab(requestedTab) ? requestedTab : "overview";
+        writeHtml(response, 200, renderScraperPage(target, tab, status));
         return;
       }
 

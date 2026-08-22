@@ -26,6 +26,17 @@ import {
   isShowingStaleData,
   renderDashboardPage,
 } from "../dist/presentation/web/dashboard-page.js";
+import {
+  isScraperTab,
+  renderScraperPage,
+  SCRAPER_TABS,
+} from "../dist/presentation/web/scraper-page.js";
+import {
+  renderActivityPage,
+  renderDataPage,
+  renderScrapersPage,
+  renderSettingsPage,
+} from "../dist/presentation/web/list-pages.js";
 import { EXPORT_FORMATS } from "../dist/presentation/export/export-records.js";
 import { profileContract } from "../dist/domain/contracts/data-contract.js";
 import { loadConfig } from "../dist/config/config.js";
@@ -450,6 +461,7 @@ const target = {
   label: "Demo target",
   collectorId: "c_test",
   targetUrl: "https://example.test/catalog",
+  fieldDescription: "Extract product name, SKU, numeric price, and availability.",
   controllable: true,
   records: RECORDS,
   collectedAt: new Date().toISOString(),
@@ -459,6 +471,13 @@ const target = {
   contract: profileContract(RECORDS),
   provisioning: null,
   steps: [] as unknown[],
+  health: {
+    extraction: 1,
+    schema: 1,
+    freshness: null,
+    overall: 1,
+    checkedAt: new Date().toISOString(),
+  },
 };
 
 /** One recorded pipeline step, as the activity log emits them. */
@@ -489,6 +508,227 @@ const event = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
+const status = (overrides: Record<string, unknown> = {}) =>
+  ({
+    configured: true,
+    autoHealEnabled: true,
+    geminiEnabled: false,
+    scheduleMinutes: null,
+    canAddTargets: true,
+    requiresToken: false,
+    targets: [target],
+    ...overrides,
+  }) as never;
+
+describe("scraper detail page", () => {
+  const detail = (tab: string, overrides: Record<string, unknown> = {}) =>
+    renderScraperPage({ ...target, ...overrides } as never, tab as never, status());
+
+  it("offers all four sections, with the current one marked", () => {
+    const html = detail("overview");
+    for (const label of ["Overview", "Data", "Contract", "Activity"]) {
+      assert.ok(html.includes(`>${label}</a>`), label);
+    }
+    assert.match(html, /href="\/scrapers\/demo"[^>]*aria-current="page"/);
+  });
+
+  it("accepts every tab name", () => {
+    for (const tab of SCRAPER_TABS) {
+      assert.equal(isScraperTab(tab), true, tab);
+      assert.ok(detail(tab).includes("<h1"), tab);
+    }
+    assert.equal(isScraperTab("nonsense"), false);
+  });
+
+  it("shows the plain-language request the extractor was built from", () => {
+    const html = detail("overview");
+    assert.match(html, /Extract product name, SKU, numeric price, and availability\./);
+    assert.match(html, /every repair reuses this same id/);
+  });
+
+  it("distinguishes a controlled site from one we do not control", () => {
+    assert.match(detail("overview", { controllable: true }), /layout switchable/);
+    assert.match(detail("overview", { controllable: false }), /site we do not control/);
+  });
+
+  it("builds data columns from whatever fields the site returned", () => {
+    const articles = [{ headline: "Something happened", byline: "A. Reporter", words: 900 }];
+    const html = detail("data", {
+      records: articles,
+      contract: profileContract(articles),
+    });
+    assert.match(html, /<th scope="col">headline<\/th>/);
+    assert.match(html, /<th scope="col">byline<\/th>/);
+    assert.ok(html.includes("A. Reporter"));
+    // Nothing catalog-specific may leak into a site that has no such fields.
+    assert.ok(!html.includes(">sku<"));
+  });
+
+  it("escapes markup in scraped values and field names", () => {
+    const hostile = [{ "<img src=x onerror=alert(1)>": "<script>alert(1)</script>" }];
+    const html = detail("data", {
+      records: hostile,
+      contract: profileContract(hostile),
+    });
+    assert.ok(!html.includes("<script>alert(1)</script>"));
+    assert.ok(!html.includes("<img src=x"));
+    assert.ok(html.includes("&lt;script&gt;"));
+    assert.ok(html.includes("&lt;img"));
+  });
+
+  it("says plainly when there is nothing verified to show", () => {
+    const html = detail("data", { records: [], collectedAt: null });
+    assert.match(html, /No verified data collected yet/);
+    assert.ok(!html.includes("/export?format="));
+  });
+
+  it("offers a download for every supported format", () => {
+    const html = detail("data");
+    for (const format of EXPORT_FORMATS) {
+      assert.ok(html.includes(`/api/targets/demo/export?format=${format}`), format);
+    }
+  });
+
+  it("spells out the rules the contract enforces", () => {
+    const html = detail("contract");
+    assert.match(html, /must be present and non-empty in every row/);
+    assert.match(html, /must keep the type it was learned with/);
+    assert.match(html, /must be unique/);
+    assert.match(html, /field\(s\) monitored/);
+  });
+
+  it("reports schema integrity as a measured figure", () => {
+    const html = detail("contract");
+    assert.match(html, /fields intact/);
+    assert.match(html, /drift events/);
+    assert.match(html, /verified repairs/);
+  });
+
+  it("separates self-healing events from ordinary scrapes", () => {
+    const html = detail("activity", {
+      events: [
+        event({
+          classification: "structural_break",
+          state: "suspected",
+          healPrompt: "Re-extract the price.",
+          evidence: ["price is missing."],
+        }),
+      ],
+    });
+    assert.match(html, /Self-healing events/);
+    assert.match(html, /Schema drift detected/);
+    assert.match(html, /Repair instruction sent to Scraper Studio/);
+    assert.match(html, /Re-extract the price\./);
+  });
+
+  it("says so when a site has never drifted", () => {
+    const html = detail("activity", { events: [event()] });
+    assert.match(html, /No schema drift has been detected/);
+  });
+
+  it("reads run metrics as a sentence rather than as 0\/0", () => {
+    const empty = detail("activity", {
+      events: [
+        event({ beforeMetrics: { rowCount: 0, validRowCount: 0, missingByField: {}, nullByField: {} } }),
+      ],
+    });
+    assert.match(empty, /no rows returned/);
+    assert.ok(!empty.includes("0/0 valid"));
+
+    const partial = detail("activity", {
+      events: [
+        event({ beforeMetrics: { rowCount: 4, validRowCount: 1, missingByField: {}, nullByField: {} } }),
+      ],
+    });
+    assert.match(partial, /1 of 4 row\(s\) valid/);
+  });
+
+  it("shows the full step sequence, not a truncated one", () => {
+    const html = detail("activity", {
+      steps: [
+        step({ stage: "validate", status: "done" }),
+        step({ stage: "build_scraper", status: "done" }),
+        step({ stage: "collect", status: "done" }),
+        step({ stage: "read_output", status: "done" }),
+        step({ stage: "check_contract", status: "done" }),
+        step({ stage: "classify", status: "done" }),
+        step({ stage: "learn_contract", status: "done" }),
+        step({ stage: "publish", status: "done" }),
+      ],
+    });
+    assert.match(html, /Request accepted/);
+    assert.match(html, /Extractor built/);
+    assert.match(html, /Data published/);
+  });
+
+  it("links back to the list", () => {
+    assert.match(detail("overview"), /href="\/scrapers"/);
+  });
+});
+
+describe("list pages", () => {
+  it("lists every scraper with its health", () => {
+    const html = renderScrapersPage(status());
+    assert.match(html, /Demo target/);
+    assert.match(html, /<th scope="col">Health<\/th>/);
+    assert.match(html, /href="\/scrapers\/demo"/);
+  });
+
+  it("says so when there is nothing to list", () => {
+    assert.match(renderScrapersPage(status({ targets: [] })), /No scrapers yet/);
+  });
+
+  it("merges activity across scrapers, newest first", () => {
+    const older = { ...target, id: "a", label: "Older" };
+    const newer = { ...target, id: "b", label: "Newer" };
+    const html = renderActivityPage(
+      status({
+        targets: [
+          { ...older, events: [event({ createdAt: "2026-08-22T01:00:00Z" })] },
+          { ...newer, events: [event({ createdAt: "2026-08-22T02:00:00Z" })] },
+        ],
+      }),
+    );
+    assert.ok(html.indexOf("Newer") < html.indexOf("Older"), "newest must come first");
+    assert.match(html, /verified repairs/);
+  });
+
+  it("shows verified data per scraper on the data page", () => {
+    const html = renderDataPage(status());
+    assert.match(html, /verified record\(s\) across/);
+    assert.match(html, /MTR-100/);
+    assert.match(html, /export\?format=csv/);
+  });
+
+  it("says so when nothing has been verified", () => {
+    assert.match(renderDataPage(status({ targets: [] })), /Nothing verified yet/);
+  });
+
+  it("reports configuration without revealing a secret", () => {
+    const html = renderSettingsPage(
+      status({ geminiEnabled: true, requiresToken: true, scheduleMinutes: 30 }),
+    );
+    assert.match(html, /Automatic repair/);
+    assert.match(html, /Gemini second opinion/);
+    assert.match(html, /Every <strong>30<\/strong> minutes/);
+    assert.match(html, /48<\/strong> scrapes per scraper per day/);
+    // How health is derived must be stated, not left as a magic number.
+    assert.match(html, /How health is measured/);
+
+    // The real guarantee is structural: the view model carries no secret to
+    // leak. Capabilities are booleans, so the page can only ever say on or off.
+    const model = status() as unknown as Record<string, unknown>;
+    for (const key of ["autoHealEnabled", "geminiEnabled", "canAddTargets", "requiresToken"]) {
+      assert.equal(typeof model[key], "boolean", key);
+    }
+    assert.ok(!Object.keys(model).some((key) => /key|token|secret|password/i.test(key) && typeof model[key] === "string"));
+  });
+
+  it("says there is no schedule when none is set", () => {
+    assert.match(renderSettingsPage(status()), /No unattended scrapes/);
+  });
+});
+
 describe("dashboard rendering", () => {
   const page = (state: string, overrides: Record<string, unknown> = {}) =>
     renderDashboardPage({
@@ -501,24 +741,45 @@ describe("dashboard rendering", () => {
       targets: [{ ...target, state, ...overrides }],
     } as never);
 
-  it("escapes markup in catalog values", () => {
-    const html = page("healthy", {
-      records: [
-        { name: "<script>alert(1)</script>", sku: "X'1", price: 1, availability: "in_stock" },
-      ],
-    });
+  it("escapes markup in a scraper's own name", () => {
+    const html = page("healthy", { label: "<script>alert(1)</script>" });
     assert.ok(!html.includes("<script>alert(1)</script>"));
     assert.ok(html.includes("&lt;script&gt;"));
-    assert.ok(html.includes("&#39;"));
+  });
+
+  it("does not put raw scraped rows on the dashboard at all", () => {
+    // The dashboard is about the health of each extractor. The rows live on the
+    // scraper's own page, which is what keeps this screen readable.
+    const html = page("healthy");
+    assert.ok(!html.includes("<th scope="), "no data table belongs on the dashboard");
+    assert.ok(!html.includes("MTR-100"), "scraped values belong on the scraper's page");
   });
 
   it("shows the collector id, since it is the proof of platform use", () => {
     assert.ok(page("healthy").includes("c_test"));
   });
 
-  it("distinguishes a controlled site from one we do not control", () => {
-    assert.match(page("healthy", { controllable: true }), /layout switchable/);
-    assert.match(page("healthy", { controllable: false }), /site we do not control/);
+  it("leads with the product's claim, not with a form", () => {
+    const html = page("healthy");
+    assert.match(html, /Self-healing web intelligence/);
+    assert.match(html, /Your scraper shouldn't break when the web changes\./);
+    // The call to action comes first; the form is behind it.
+    assert.match(html, /id="reveal-form"/);
+    assert.match(html, /\+ Add a website/);
+  });
+
+  it("keeps the create form collapsed until it is asked for", () => {
+    const html = page("healthy");
+    // A large form is the wrong first impression for a monitoring product.
+    assert.match(html, /id="create-panel"[^>]*hidden/);
+    assert.match(html, /aria-expanded="false"/);
+  });
+
+  it("names the three capabilities under the hero", () => {
+    const html = page("healthy");
+    for (const capability of ["Auto-healing", "Data validation", "Schema monitoring"]) {
+      assert.ok(html.includes(capability), capability);
+    }
   });
 
   it("renders every orchestration state with a text label", () => {
@@ -537,7 +798,7 @@ describe("dashboard rendering", () => {
     for (const state of states) {
       const html = page(state);
       assert.ok(html.includes("<h1>SupaScraper</h1>"), state);
-      assert.ok(/class="value state \w+"/.test(html), state);
+      assert.ok(/class="status \w+"/.test(html), state);
     }
   });
 
@@ -593,7 +854,13 @@ describe("dashboard rendering", () => {
     assert.ok(html.includes("Demo target"));
     assert.ok(html.includes("Real external site"));
     assert.ok(html.includes("c_other"));
-    assert.match(html, /every 30 min/);
+  });
+
+  it("summarizes the fleet before the individual scrapers", () => {
+    const html = page("healthy");
+    for (const caption of ["scrapers", "fleet health", "records", "fields monitored", "self-repairs"]) {
+      assert.ok(html.includes(caption), caption);
+    }
   });
 
   it("handles the empty and unconfigured cases", () => {
@@ -606,27 +873,11 @@ describe("dashboard rendering", () => {
       requiresToken: false,
       targets: [],
     } as never);
-    assert.match(empty, /No sites yet/);
-    assert.ok(empty.includes("auto-repair off"));
+    assert.match(empty, /No scrapers yet/);
 
     const noData = page("idle", { records: [], collectedAt: null });
-    assert.ok(noData.includes("No verified data collected yet"));
     assert.ok(noData.includes("never"));
-  });
-
-  it("builds columns from whatever fields the site returned", () => {
-    const articles = [
-      { headline: "Something happened", byline: "A. Reporter", words: 900 },
-    ];
-    const html = page("healthy", {
-      records: articles,
-      contract: profileContract(articles),
-    });
-    assert.match(html, /<th scope="col">headline<\/th>/);
-    assert.match(html, /<th scope="col">byline<\/th>/);
-    assert.ok(html.includes("A. Reporter"));
-    // Nothing catalog-specific may leak into a site that has no such fields.
-    assert.ok(!html.includes(">sku<"));
+    assert.ok(!noData.includes("/export?format="));
   });
 
   it("offers a download for every supported format", () => {
@@ -644,26 +895,43 @@ describe("dashboard rendering", () => {
     assert.ok(!html.includes("/export?format="));
   });
 
-  it("shows the learned contract, so the guarantee is visible", () => {
+  it("shows the learned contract on the card, so the guarantee is visible", () => {
     const html = page("healthy");
-    assert.match(html, /Learned data contract/);
-    assert.match(html, /Rows are identified by/);
+    assert.match(html, /Data contract/);
+    assert.match(html, /row identity/);
+    // Field names carry their learned type.
+    assert.match(html, /<span class="name">price<\/span>/);
   });
 
   it("says so when no contract has been learned yet", () => {
     const html = page("idle", { records: [], contract: null });
-    assert.match(html, /No contract learned yet/);
+    assert.match(html, /No contract yet/);
   });
 
-  it("shows a site whose scraper is still being built", () => {
+  it("shows health as measured components, not just a badge", () => {
+    const html = page("healthy");
+    for (const label of ["Extraction", "Schema", "Freshness"]) {
+      assert.ok(html.includes(label), label);
+    }
+    assert.match(html, /Last checked/);
+  });
+
+  it("shows a dash for a health component it could not measure", () => {
+    // Freshness is unmeasurable without a schedule, and a flattering default
+    // would be a lie about a question nobody asked.
+    const html = page("healthy");
+    assert.match(html, /<span class="v">—<\/span>/);
+  });
+
+  it("shows a site whose extractor is still being built", () => {
     const html = page("idle", {
       records: [],
       contract: null,
-      provisioning: "Bright Data is building a scraper for this page.",
+      provisioning: "Bright Data is building the extractor for this page.",
     });
-    assert.match(html, /Building scraper/);
-    assert.match(html, /building a scraper/i);
-    // Collecting cannot be requested before the scraper exists.
+    assert.match(html, /Building/);
+    assert.match(html, /building the extractor/i);
+    // Scraping cannot be requested before the extractor exists.
     assert.match(html, /<button data-target="demo" disabled>/);
   });
 
@@ -685,7 +953,7 @@ describe("dashboard rendering", () => {
       targets: [{ ...target, state: "healthy" }],
     } as never);
     assert.ok(!html.includes('id="add-form"'));
-    assert.match(html, /needs the Bright Data CLI/);
+    assert.match(html, /Bright Data CLI is not reachable/);
   });
 
   it("escapes a hostile field name as well as a hostile value", () => {
@@ -698,31 +966,63 @@ describe("dashboard rendering", () => {
     assert.ok(html.includes("&lt;img"));
   });
 
-  it("uses no colour, only black, white, and greys", () => {
+  it("keeps the palette to greys plus a small, deliberate set of hues", () => {
+    // Structure is carried by greys so the page stays calm; a handful of hues
+    // carry meaning. Without a bound, "one accent" quietly becomes a rainbow.
     const html = page("healthy");
-    const colours = [...html.matchAll(/#[0-9a-f]{3,6}\b/gi)].map((match) =>
-      match[0].toLowerCase(),
-    );
-    assert.ok(colours.length > 0, "expected the stylesheet to declare colours");
+    const channels = (hex: string): [number, number, number] => [
+      Number.parseInt(hex.slice(1, 3), 16),
+      Number.parseInt(hex.slice(3, 5), 16),
+      Number.parseInt(hex.slice(5, 7), 16),
+    ];
 
-    for (const colour of colours) {
-      const hex =
-        colour.length === 4
-          ? `#${colour[1]}${colour[1]}${colour[2]}${colour[2]}${colour[3]}${colour[3]}`
-          : colour;
-      const r = Number.parseInt(hex.slice(1, 3), 16);
-      const g = Number.parseInt(hex.slice(3, 5), 16);
-      const b = Number.parseInt(hex.slice(5, 7), 16);
-      // A grey has equal channels. Anything else is a hue.
-      assert.ok(r === g && g === b, `${colour} is not greyscale`);
-    }
+    const hues = new Set(
+      [...html.matchAll(/#[0-9a-f]{6}\b/gi)]
+        .map((match) => match[0].toLowerCase())
+        .filter((colour) => {
+          const [r, g, b] = channels(colour);
+          return !(r === g && g === b);
+        }),
+    );
+
+    assert.ok(hues.size > 0, "expected at least one accent");
+    assert.ok(hues.size <= 8, `too many hues: ${[...hues].join(", ")}`);
   });
 
-  it("puts the page on white and the type in black", () => {
+  it("uses green for health, red for failure, and blue only for times", () => {
+    const html = page("healthy");
+    const channelsOf = (name: string): [number, number, number] => {
+      const found = new RegExp(`${name}:(#[0-9a-f]{6})`, "i").exec(html);
+      assert.ok(found?.[1], `${name} is not declared`);
+      const hex = found[1];
+      return [
+        Number.parseInt(hex.slice(1, 3), 16),
+        Number.parseInt(hex.slice(3, 5), 16),
+        Number.parseInt(hex.slice(5, 7), 16),
+      ];
+    };
+
+    const [gr, gg, gb] = channelsOf("--good");
+    assert.ok(gg > gr && gg > gb, "health accent must be green");
+
+    const [br, bg, bb] = channelsOf("--bad");
+    assert.ok(br > bg && br > bb, "failure accent must be red");
+
+    const [tr, tg, tb] = channelsOf("--time");
+    assert.ok(tb > tr && tb > tg, "time accent must be blue");
+  });
+
+  it("puts the page on white with near-black type", () => {
     const html = page("healthy");
     assert.match(html, /--paper:#ffffff/);
-    assert.match(html, /--ink:#000000/);
+    assert.match(html, /--ink:#0a0a0a/);
     assert.match(html, /color-scheme: light/);
+  });
+
+  it("draws surfaces with crisp single-pixel borders and no shadows", () => {
+    const html = page("healthy");
+    assert.match(html, /\.panel \{ background:var\(--paper\); border:1px solid var\(--line\)/);
+    assert.ok(!/box-shadow/.test(html), "shadows soften the straight lines asked for");
   });
 
   it("explains a proxy failure instead of showing a bare status code", () => {
@@ -743,32 +1043,24 @@ describe("dashboard rendering", () => {
     });
 
     assert.match(html, /proxy refused the connection/i);
-    assert.match(html, /Could not connect/);
     assert.match(html, /Nothing was repaired, because nothing reached the site/i);
-    // The raw message is still available, just no longer the whole story.
-    assert.match(html, /statusCode=407/);
   });
 
-  it("reads run metrics as a sentence rather than as 0\/0", () => {
-    const empty = page("manual_review", {
-      records: [],
-      collectedAt: null,
-      events: [event({ beforeMetrics: { rowCount: 0, validRowCount: 0, missingByField: {}, nullByField: {} } })],
+  it("counts schema drift on the card", () => {
+    const html = page("suspected", {
+      events: [
+        event({ classification: "structural_break", state: "suspected" }),
+        event({ id: "0", classification: "healthy", state: "healthy" }),
+      ],
     });
-    assert.match(empty, /no rows returned/);
-    assert.ok(!empty.includes("0/0 valid"));
-
-    const partial = page("manual_review", {
-      events: [event({ beforeMetrics: { rowCount: 4, validRowCount: 1, missingByField: {}, nullByField: {} } })],
-    });
-    assert.match(partial, /1 of 4 row\(s\) valid/);
+    assert.match(html, /Schema drift events: <strong>1<\/strong>/);
   });
 
   it("tells the reader what to do when a break needs a repair", () => {
     const withHeal = page("suspected", {
       events: [event({ classification: "structural_break", state: "suspected" })],
     });
-    assert.match(withHeal, /repair should start automatically/i);
+    assert.match(withHeal, /repair should start on its own/i);
 
     const withoutHeal = renderDashboardPage({
       configured: true,
@@ -788,10 +1080,24 @@ describe("dashboard rendering", () => {
     assert.match(withoutHeal, /SUPASCRAPER_AUTO_HEAL=true/);
   });
 
-  it("says plainly that a site has never been collected", () => {
+  it("says plainly that a site has never been scraped", () => {
     const html = page("idle", { records: [], collectedAt: null, events: [] });
-    assert.match(html, /Never collected/);
-    assert.match(html, /Choose Collect now/);
+    assert.match(html, /Never scraped/);
+    assert.match(html, /Choose Scrape now/);
+  });
+
+  it("links each card to its own scraper page", () => {
+    const html = page("healthy");
+    assert.match(html, /href="\/scrapers\/demo"/);
+    assert.match(html, /Open &rarr;/);
+  });
+
+  it("offers the same navigation on every page", () => {
+    const html = page("healthy");
+    for (const item of ["Dashboard", "Scrapers", "Activity", "Data", "Settings"]) {
+      assert.ok(html.includes(`>${item}</a>`), item);
+    }
+    assert.match(html, /aria-current="page"/);
   });
 });
 
@@ -810,26 +1116,26 @@ describe("pipeline visibility", () => {
   it("names every step it takes, in order", () => {
     const html = page({
       steps: [
-        step({ stage: "validate" }),
-        step({ stage: "build_scraper" }),
-        step({ stage: "collect" }),
-        step({ stage: "read_output" }),
-        step({ stage: "check_contract" }),
-        step({ stage: "classify" }),
-        step({ stage: "learn_contract" }),
-        step({ stage: "publish" }),
+        step({ stage: "validate", status: "done" }),
+        step({ stage: "build_scraper", status: "done" }),
+        step({ stage: "collect", status: "done" }),
+        step({ stage: "read_output", status: "done" }),
+        step({ stage: "check_contract", status: "done" }),
+        step({ stage: "classify", status: "done" }),
+        step({ stage: "learn_contract", status: "done" }),
+        step({ stage: "publish", status: "done" }),
       ],
     });
 
+    // The card keeps only the most recent steps so it stays compact; the full
+    // sequence is on the scraper's own page.
     const expected = [
-      "Check the page and the request",
-      "Build the scraper with Bright Data",
-      "Run the collector",
-      "Read the output",
-      "Check it against the contract",
-      "Decide what happened",
-      "Learn the data contract",
-      "Publish the verified data",
+      "Scrape completed",
+      "Output read",
+      "Data validated",
+      "Run classified",
+      "Data contract learned",
+      "Data published",
     ];
 
     let cursor = -1;
@@ -847,31 +1153,43 @@ describe("pipeline visibility", () => {
         step({ stage: "heal", status: "done" }),
         step({ stage: "review_fix", status: "done" }),
         step({ stage: "apply_fix", status: "done" }),
-        step({ stage: "verify", status: "started" }),
+        step({ stage: "verify", status: "done" }),
       ],
     });
-    assert.match(html, /Ask Scraper Studio to repair it/);
-    assert.match(html, /Review the proposed fix/);
-    assert.match(html, /Approve and save the fix/);
-    assert.match(html, /Re-run and verify recovery/);
+    assert.match(html, /Repair proposed/);
+    assert.match(html, /Proposed fix reviewed/);
+    assert.match(html, /Fix applied to the same collector/);
+    assert.match(html, /Scraper repaired successfully/);
   });
 
-  it("distinguishes in progress, done, failed, and not needed", () => {
+  it("reads a drift detection as drift, not as a generic failure", () => {
     const html = page({
-      steps: [
-        step({ stage: "collect", status: "done" }),
-        step({ stage: "check_contract", status: "failed" }),
-        step({ stage: "learn_contract", status: "skipped" }),
-        step({ stage: "heal", status: "started" }),
-      ],
+      steps: [step({ stage: "check_contract", status: "failed" })],
     });
-    for (const word of ["done", "failed", "not needed", "in progress"]) {
-      assert.ok(html.includes(word), word);
-    }
-    // A step that was correctly not taken must not look like one that succeeded.
-    assert.match(html, /class="step skipped"/);
-    assert.match(html, /class="step failed"/);
-    assert.match(html, /class="step started"/);
+    assert.match(html, /Schema drift detected/);
+  });
+
+  it("never lets a withheld publish read like a successful one", () => {
+    // The single most dangerous confusion this product can present.
+    const withheld = page({ steps: [step({ stage: "publish", status: "skipped" })] });
+    assert.match(withheld, /Data withheld/);
+    assert.ok(!withheld.includes("Data published"));
+
+    const published = page({ steps: [step({ stage: "publish", status: "done" })] });
+    assert.match(published, /Data published/);
+    assert.ok(!published.includes("Data withheld"));
+  });
+
+  it("does not claim a contract was learned when the step was skipped", () => {
+    const html = page({ steps: [step({ stage: "learn_contract", status: "skipped" })] });
+    assert.match(html, /Contract already known/);
+    assert.ok(!html.includes("Data contract learned"));
+  });
+
+  it("marks a step that is still running", () => {
+    const html = page({ steps: [step({ stage: "heal", status: "started" })] });
+    assert.match(html, /<li class="started">/);
+    assert.match(html, /Repair agent activated/);
   });
 
   it("shows each step's own explanation, not just its name", () => {
@@ -879,11 +1197,19 @@ describe("pipeline visibility", () => {
       steps: [
         step({
           stage: "learn_contract",
+          status: "done",
           detail: "Learned from this run: title, price, identified by title.",
         }),
       ],
     });
     assert.match(html, /Learned from this run: title, price/);
+  });
+
+  it("stamps each step with a clock time, so a sequence can be read", () => {
+    const html = page({
+      steps: [step({ stage: "collect", at: "2026-08-23T00:42:00Z" })],
+    });
+    assert.match(html, /<span class="at">\d{2}:\d{2}<\/span>/);
   });
 
   it("escapes a step detail, since it can carry text from the site", () => {
@@ -943,22 +1269,12 @@ describe("groupEvents", () => {
     assert.equal(groupEvents(mixed).length, 2);
   });
 
-  it("reports a repeat count on the page", () => {
-    const html = renderDashboardPage({
-      configured: true,
-      autoHealEnabled: true,
-      geminiEnabled: false,
-      scheduleMinutes: null,
-      canAddTargets: true,
-      requiresToken: false,
-      targets: [
-        {
-          ...target,
-          state: "manual_review",
-          events: [event({ id: "2" }), event({ id: "1" })],
-        },
-      ],
-    } as never);
+  it("reports a repeat count in the scrape history", () => {
+    const html = renderScraperPage(
+      { ...target, state: "manual_review", events: [event({ id: "2" }), event({ id: "1" })] },
+      "activity",
+      status(),
+    );
     assert.match(html, /2 runs, same outcome/);
   });
 
