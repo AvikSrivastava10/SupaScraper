@@ -1,4 +1,4 @@
-import type { ContractMetrics } from "../contracts/catalog-contract.js";
+import type { ContractMetrics } from "../contracts/data-contract.js";
 import type { DetectionClassification } from "../detection/classify-run.js";
 import type { OrchestrationState } from "../state-machine/state-machine.js";
 

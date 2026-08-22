@@ -5,6 +5,13 @@ export {
 export type { Availability, CatalogRecord } from "./catalog.js";
 
 export {
+  IDENTITY_HINTS,
+  VENDOR_FIELDS,
+  isVendorField,
+} from "./record.js";
+export type { FieldType, ScrapedRecord } from "./record.js";
+
+export {
   SCENARIO_MODES,
   isScenarioControlAction,
   isScenarioMode,

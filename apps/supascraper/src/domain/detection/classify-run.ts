@@ -1,6 +1,9 @@
-import type { CatalogRecord } from "@supascraper/shared";
+import type { ScrapedRecord } from "@supascraper/shared";
 
-import type { ContractEvaluation } from "../contracts/catalog-contract.js";
+import type {
+  ContractEvaluation,
+  DataContract,
+} from "../contracts/data-contract.js";
 import type { NormalizedRunResult } from "../contracts/collector-run.js";
 import { compareToBaseline, describeDiff } from "./compare-baseline.js";
 
@@ -42,7 +45,9 @@ export function classifyRun(
   run: NormalizedRunResult,
   evaluation: ContractEvaluation,
   /** Last verified data, used to tell a real change from a broken extraction. */
-  baseline: readonly CatalogRecord[] | null = null,
+  baseline: readonly ScrapedRecord[] | null = null,
+  /** Supplies the identity field that makes a row-level diff possible. */
+  contract: DataContract | null = null,
 ): DetectionDecision {
   // 1. The run itself did not complete. This is transport, never structure.
   if (run.status !== "succeeded") {
@@ -150,7 +155,7 @@ export function classifyRun(
 
   // 7. Valid output that differs from history: the site's data moved, and the
   //    scraper is doing its job. Publish it.
-  const diff = compareToBaseline(baseline, evaluation.acceptedRecords);
+  const diff = compareToBaseline(baseline, evaluation.acceptedRecords, contract);
   if (diff.hasChanges) {
     return {
       classification: "legitimate_change",

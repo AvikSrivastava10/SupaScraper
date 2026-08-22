@@ -1,6 +1,4 @@
-import type { CatalogFieldName } from "../contracts/catalog-contract.js";
-import { CATALOG_FIELD_NAMES } from "@supascraper/shared";
-import type { ContractEvaluation } from "../contracts/catalog-contract.js";
+import type { ContractEvaluation } from "../contracts/data-contract.js";
 import type { NormalizedRunResult } from "../contracts/collector-run.js";
 
 /** Verified limit for `scraper heal` in CLI 0.3.5. */
@@ -12,16 +10,28 @@ export interface HealPromptInput {
   readonly evaluation: ContractEvaluation;
 }
 
-function affectedFields(evaluation: ContractEvaluation): CatalogFieldName[] {
-  const affected = new Set<CatalogFieldName>();
+/** Field names are site-defined, so only plain identifier-like names are relayed. */
+const SAFE_FIELD_NAME = /^[A-Za-z0-9_\-. ]{1,40}$/;
+
+const MAX_REPORTED_FIELDS = 8;
+
+/**
+ * Names the fields a failing run could not produce, read from violation paths.
+ *
+ * Deriving them from the evaluation rather than from a fixed field list is what
+ * lets the same prompt builder serve any site.
+ */
+function affectedFields(evaluation: ContractEvaluation): string[] {
+  const affected = new Set<string>();
   for (const violation of evaluation.violations) {
-    for (const field of CATALOG_FIELD_NAMES) {
-      if (violation.path.endsWith(`.${field}`) || violation.code.startsWith(field)) {
-        affected.add(field);
-      }
+    const separator = violation.path.lastIndexOf(".");
+    if (separator === -1) continue;
+    const field = violation.path.slice(separator + 1);
+    if (SAFE_FIELD_NAME.test(field)) {
+      affected.add(field);
     }
   }
-  return [...affected];
+  return [...affected].slice(0, MAX_REPORTED_FIELDS);
 }
 
 /** Characters a CSS or XPath selector may contain. */

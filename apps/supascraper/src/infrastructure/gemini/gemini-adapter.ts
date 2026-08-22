@@ -1,4 +1,4 @@
-import type { ContractEvaluation } from "../../domain/contracts/catalog-contract.js";
+import type { ContractEvaluation } from "../../domain/contracts/data-contract.js";
 import type { NormalizedRunResult } from "../../domain/contracts/collector-run.js";
 import type {
   DetectionClassification,
@@ -74,7 +74,7 @@ export function buildReasoningPayload(context: ReasoningContext): Record<string,
 }
 
 const INSTRUCTIONS = [
-  "You are reviewing an automated web-scraping run for a product catalog.",
+  "You are reviewing an automated web-scraping run against its expected data contract.",
   "Classify it as exactly one of: healthy, legitimate_change, structural_break, transient_error, ambiguous.",
   "structural_break means the page loaded but extraction no longer matches it.",
   "transient_error means the run or page failed to load.",
