@@ -1,5 +1,8 @@
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
+import type { CollectorFactory } from "./application/add-target/add-target.js";
 import {
   ContractPreviewReviewer,
   type HealAndVerifyDependencies,
@@ -17,24 +20,38 @@ import {
 } from "./infrastructure/gemini/gemini-adapter.js";
 import { ConsoleLogger } from "./infrastructure/logging/logger.js";
 import { JsonFileRepository } from "./infrastructure/persistence/json-file-repository.js";
+import { FileTargetRegistry } from "./infrastructure/persistence/target-store.js";
 import { createApplicationServer } from "./presentation/api/server.js";
+
+const CLI_ENTRY_POINT = "node_modules/@brightdata/cli/dist/index.js";
 
 export function startApplication(): void {
   const config = loadConfig();
   const logger = new ConsoleLogger();
   const repository = new JsonFileRepository(config.dataPath);
 
-  // Without a configured target there is nothing to run, so the adapter that
-  // refuses every operation is the honest choice.
-  const adapter =
-    config.targets.length > 0
-      ? new BrightDataCliAdapter(new ProcessCliRunner(), logger)
-      : new UnconfiguredBrightDataAdapter();
+  // Sites can now be added while the process runs, so the registry rather than
+  // the config is the source of truth for what is monitored.
+  const registry = new FileTargetRegistry(
+    config.targets,
+    config.addedTargetsPath,
+    config.defaultRunTimeoutMs,
+  );
+
+  // Availability is decided by whether the pinned CLI is actually on disk, not
+  // by whether a target happens to be configured. A site added through the
+  // dashboard needs the CLI before any target exists.
+  const cliAvailable = existsSync(resolve(CLI_ENTRY_POINT));
+  const adapter = cliAvailable
+    ? new BrightDataCliAdapter(new ProcessCliRunner(), logger)
+    : new UnconfiguredBrightDataAdapter();
+
+  const factory: CollectorFactory | undefined = cliAvailable ? adapter : undefined;
 
   // Repair dependencies are only assembled when automatic healing is enabled,
   // so an accidental code path cannot mutate a collector.
   const repair: HealAndVerifyDependencies | undefined =
-    config.autoHealEnabled && config.targets.length > 0
+    config.autoHealEnabled && cliAvailable
       ? {
           healer: adapter,
           approver: adapter,
@@ -61,6 +78,8 @@ export function startApplication(): void {
     repository,
     runner: adapter,
     logger,
+    targets: registry,
+    ...(factory === undefined ? {} : { factory }),
     ...(repair === undefined ? {} : { repair }),
     ...(reasoner === undefined ? {} : { reasoner }),
   });
@@ -71,19 +90,28 @@ export function startApplication(): void {
     logger.info("SupaScraper is listening.", {
       host: config.host,
       port: config.port,
-      targets: config.targets.length,
+      targets: registry.list().length,
+      pending: registry.pending().length,
+      canAddSites: factory !== undefined,
       autoHealEnabled: repair !== undefined,
       geminiEnabled: reasoner !== undefined,
       runEndpointProtected: config.apiToken !== null,
     });
 
-    for (const target of config.targets) {
+    for (const target of registry.list()) {
       logger.info("Monitoring target.", {
         id: target.id,
         collectorId: target.collectorId,
         url: target.targetUrl,
         controllable: target.controllable,
       });
+    }
+
+    if (!cliAvailable) {
+      logger.info(
+        "The Bright Data CLI was not found, so collection and site creation are disabled.",
+        { expectedAt: CLI_ENTRY_POINT },
+      );
     }
 
     if (repair !== undefined) {
@@ -94,14 +122,14 @@ export function startApplication(): void {
 
     if (!isLoopbackHost(config.host)) {
       logger.info(
-        "Bound to a non-loopback address; the run endpoint requires a bearer token.",
+        "Bound to a non-loopback address; write endpoints require a bearer token.",
         { host: config.host },
       );
     }
 
     // The schedule reuses the server's guarded trigger, so unattended runs obey
     // the same in-flight guard and publication rules as a manual one.
-    if (config.scheduleIntervalMs !== null && config.targets.length > 0) {
+    if (config.scheduleIntervalMs !== null) {
       scheduler = startScheduler({
         intervalMs: config.scheduleIntervalMs,
         trigger: () => app.triggerRun(),
