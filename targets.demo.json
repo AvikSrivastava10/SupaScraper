@@ -1,0 +1,21 @@
+{
+  "comment": "Preloaded pair for demonstrating a break and its repair. Enable with SUPASCRAPER_TARGETS_PATH=./targets.demo.json. The controlled site is the only one whose markup can be changed on command, which is what makes a live break reproducible; the external site proves the same pipeline works on a page nobody here controls.",
+  "targets": [
+    {
+      "id": "demo-supplier",
+      "label": "Controlled supplier catalog",
+      "collectorId": "c_mt351xy524myzqlu8x",
+      "targetUrl": "https://supascraper-target.onrender.com/catalog",
+      "fieldDescription": "Extract product name, SKU, numeric price, and availability.",
+      "controllable": true
+    },
+    {
+      "id": "books",
+      "label": "Books to Scrape — Travel category",
+      "collectorId": "c_mt3hxh7g1dg3mosktp",
+      "targetUrl": "https://books.toscrape.com/catalogue/category/books/travel_2/index.html",
+      "fieldDescription": "Extract every book in this category. For each book return four fields. name is the book title. sku is the UPC code shown on the book detail page. price is the numeric price with no currency symbol. availability is the stock status, normalised to exactly in_stock when the book is available or out_of_stock when it is not.",
+      "controllable": false
+    }
+  ]
+}

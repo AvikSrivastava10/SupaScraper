@@ -458,7 +458,17 @@ const target = {
   lastError: null,
   contract: profileContract(RECORDS),
   provisioning: null,
+  steps: [] as unknown[],
 };
+
+/** One recorded pipeline step, as the activity log emits them. */
+const step = (overrides: Record<string, unknown> = {}) => ({
+  stage: "collect",
+  status: "done",
+  detail: "The collector finished and returned output.",
+  at: new Date().toISOString(),
+  ...overrides,
+});
 
 /** A recorded run, shaped like the events the orchestrator appends. */
 const event = (overrides: Record<string, unknown> = {}) => ({
@@ -782,6 +792,121 @@ describe("dashboard rendering", () => {
     const html = page("idle", { records: [], collectedAt: null, events: [] });
     assert.match(html, /Never collected/);
     assert.match(html, /Choose Collect now/);
+  });
+});
+
+describe("pipeline visibility", () => {
+  const page = (overrides: Record<string, unknown> = {}) =>
+    renderDashboardPage({
+      configured: true,
+      autoHealEnabled: true,
+      geminiEnabled: false,
+      scheduleMinutes: null,
+      canAddTargets: true,
+      requiresToken: false,
+      targets: [{ ...target, state: "healthy", ...overrides }],
+    } as never);
+
+  it("names every step it takes, in order", () => {
+    const html = page({
+      steps: [
+        step({ stage: "validate" }),
+        step({ stage: "build_scraper" }),
+        step({ stage: "collect" }),
+        step({ stage: "read_output" }),
+        step({ stage: "check_contract" }),
+        step({ stage: "classify" }),
+        step({ stage: "learn_contract" }),
+        step({ stage: "publish" }),
+      ],
+    });
+
+    const expected = [
+      "Check the page and the request",
+      "Build the scraper with Bright Data",
+      "Run the collector",
+      "Read the output",
+      "Check it against the contract",
+      "Decide what happened",
+      "Learn the data contract",
+      "Publish the verified data",
+    ];
+
+    let cursor = -1;
+    for (const label of expected) {
+      const at = html.indexOf(label);
+      assert.ok(at > -1, `missing step: ${label}`);
+      assert.ok(at > cursor, `step out of order: ${label}`);
+      cursor = at;
+    }
+  });
+
+  it("names the repair steps too, since a repair runs unattended for minutes", () => {
+    const html = page({
+      steps: [
+        step({ stage: "heal", status: "done" }),
+        step({ stage: "review_fix", status: "done" }),
+        step({ stage: "apply_fix", status: "done" }),
+        step({ stage: "verify", status: "started" }),
+      ],
+    });
+    assert.match(html, /Ask Scraper Studio to repair it/);
+    assert.match(html, /Review the proposed fix/);
+    assert.match(html, /Approve and save the fix/);
+    assert.match(html, /Re-run and verify recovery/);
+  });
+
+  it("distinguishes in progress, done, failed, and not needed", () => {
+    const html = page({
+      steps: [
+        step({ stage: "collect", status: "done" }),
+        step({ stage: "check_contract", status: "failed" }),
+        step({ stage: "learn_contract", status: "skipped" }),
+        step({ stage: "heal", status: "started" }),
+      ],
+    });
+    for (const word of ["done", "failed", "not needed", "in progress"]) {
+      assert.ok(html.includes(word), word);
+    }
+    // A step that was correctly not taken must not look like one that succeeded.
+    assert.match(html, /class="step skipped"/);
+    assert.match(html, /class="step failed"/);
+    assert.match(html, /class="step started"/);
+  });
+
+  it("shows each step's own explanation, not just its name", () => {
+    const html = page({
+      steps: [
+        step({
+          stage: "learn_contract",
+          detail: "Learned from this run: title, price, identified by title.",
+        }),
+      ],
+    });
+    assert.match(html, /Learned from this run: title, price/);
+  });
+
+  it("escapes a step detail, since it can carry text from the site", () => {
+    const html = page({ steps: [step({ detail: "<script>alert(1)</script>" })] });
+    assert.ok(!html.includes("<script>alert(1)</script>"));
+    assert.match(html, /&lt;script&gt;/);
+  });
+
+  it("says the steps will appear rather than showing an empty box", () => {
+    const html = page({ steps: [] });
+    assert.match(html, /Nothing has run yet/);
+  });
+
+  it("refreshes faster while a step is mid-flight", () => {
+    const moving = page({ busy: true, steps: [step({ status: "started" })] });
+    assert.match(moving, /http-equiv="refresh" content="6"/);
+
+    const settled = page({ busy: true, steps: [step({ status: "done" })] });
+    assert.match(settled, /http-equiv="refresh" content="15"/);
+  });
+
+  it("does not refresh at all when nothing is happening", () => {
+    assert.ok(!page({ busy: false, steps: [] }).includes("http-equiv=\"refresh\""));
   });
 });
 

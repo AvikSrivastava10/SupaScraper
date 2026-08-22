@@ -30,8 +30,9 @@ Built for the WeMakeDevs "Into the Scrape-Verse" hackathon (17–23 August 2026)
 | Tells a data change from a broken extraction | Verified live; changed prices published without any repair |
 | Gemini second opinion | Implemented and unit-tested; needs `GEMINI_API_KEY` to run live |
 | Scheduled unattended runs | Implemented, opt-in, five-minute floor |
-| Dashboard | Add-site form, dynamic columns, downloads, repair timeline, generated prompt |
-| Automated test suite | 339 tests, no test framework dependency |
+| Live pipeline visibility | Verified; every step named as it happens, including repairs |
+| Dashboard | Add-site form, step-by-step progress, dynamic columns, downloads, repair history |
+| Automated test suite | 369 tests, no test framework dependency |
 
 Automatic repair is off unless `SUPASCRAPER_AUTO_HEAL=true`, and the repair dependencies are only assembled when it is enabled, so no accidental code path can mutate a hosted collector.
 
@@ -66,20 +67,43 @@ fixtures/           Sanitized contract and sample data
 
 ## What it monitors
 
-Two sites, for two different reasons. Both are defined in [targets.json](./targets.json).
+Nothing, until you add something. [targets.json](./targets.json) ships empty on purpose: the dashboard starts clean and you add pages through it, so the whole sequence is visible rather than buried under preloaded examples.
+
+### The demo pair
+
+A live break has to be reproducible, and no third-party site will restructure its markup while you watch. [targets.demo.json](./targets.demo.json) therefore keeps two sites available, opt-in:
+
+```bash
+SUPASCRAPER_TARGETS_PATH=./targets.demo.json
+```
 
 | Site | Collector | Why |
 |---|---|---|
-| [books.toscrape.com](https://books.toscrape.com/catalogue/category/books/travel_2/index.html) | `c_mt3hxh7g1dg3mosktp` | A real public site we do not control. Proves the pipeline works on the open web. |
 | [supascraper-target.onrender.com](https://supascraper-target.onrender.com/catalog) | `c_mt351xy524myzqlu8x` | A catalog we deployed, whose markup can be changed on command. Proves the repair works on cue. |
+| [books.toscrape.com](https://books.toscrape.com/catalogue/category/books/travel_2/index.html) | `c_mt3hxh7g1dg3mosktp` | A real public site we do not control. Proves the pipeline works on the open web. |
 
-The controlled site exists because a demo needs a break you can cause, reverse, and repeat. No third-party site will redesign its markup while you watch. But the detection and repair logic has no idea which is which: it only ever sees collector output.
-
-Both were healed by the system itself. The real site's collector initially omitted `price` and returned unnormalised availability; SupaScraper classified that as a structural break, repaired it, verified the repair, and published eleven books.
+The detection and repair logic has no idea which is which; it only ever sees collector output. Both were healed by the system itself. The real site's collector initially omitted `price` and returned unnormalised availability; SupaScraper classified that as a structural break, repaired it, verified the repair, and published eleven books.
 
 The controlled site runs on a free instance that idles out, so warm it before a demo.
 
-These two are only the seeds. Anything you add from the dashboard joins them.
+## Watching it work
+
+Every target shows the steps it is taking, in order, as they happen:
+
+```text
+✓  Run the collector                   done          Running collector c_… against https://…
+✓  Read the output                     done          1 data row(s) and 0 extraction error(s).
+✓  Check it against the contract       done          1 of 1 row(s) satisfied the learned contract.
+✓  Decide what happened                done          healthy at 100% confidence.
+–  Learn the data contract             not needed    A contract was already learned for this site.
+✓  Publish the verified data           done          1 verified row(s) published.
+```
+
+A repair adds four more: ask Scraper Studio to repair it, review the proposed fix, approve and save it, then re-run and verify recovery. Building a scraper for a newly added page adds two at the front.
+
+This matters because the slow parts are slow. A collector build runs for 5–10 minutes and a repair longer, so without named steps the page could only show a spinner and then a verdict. A step that was correctly *not* taken reads as "not needed" rather than "done", because "data was withheld" and "data was published" must never look alike.
+
+Progress is held in memory. It answers "what is happening now", and after a restart nothing is, so persisting it would only preserve a stale claim. Verified data, learned contracts, and repair history are durable.
 
 ## Adding a website
 
@@ -295,7 +319,7 @@ See [.env.example](./.env.example) for the full list. Nothing secret belongs in 
 | `SUPASCRAPER_SCHEDULE_MINUTES` | Unattended run interval; empty for none, minimum 5 |
 | `SUPASCRAPER_GEMINI_ENABLED` | Enables the second-opinion layer |
 | `SUPASCRAPER_HOST` / `SUPASCRAPER_API_TOKEN` | Loopback by default; a non-loopback bind requires a token |
-| `SUPASCRAPER_TARGETS_PATH` | Committed file defining the seeded sites |
+| `SUPASCRAPER_TARGETS_PATH` | Sites to preload. Empty by default; point at `targets.demo.json` for the break demo |
 | `SUPASCRAPER_DATA_PATH` | Where verified data, learned contracts, and repair history persist |
 | `SUPASCRAPER_ADDED_TARGETS_PATH` | Where sites added from the dashboard persist |
 | `BRIGHTDATA_API_KEY` | Optional; only for non-interactive runs |

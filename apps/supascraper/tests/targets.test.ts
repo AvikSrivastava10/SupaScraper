@@ -117,17 +117,31 @@ describe("loadConfig with targets", () => {
 });
 
 describe("the committed targets file", () => {
-  it("is valid and contains a real external site plus the controlled one", () => {
-    const contents = readFileSync(new URL("../../../targets.json", import.meta.url), "utf8");
-    const targets = parseTargetsFile(contents, 420_000);
+  const read = (name: string): string =>
+    readFileSync(new URL(`../../../${name}`, import.meta.url), "utf8");
+
+  it("preloads nothing, so the dashboard starts clean", () => {
+    // Sites are meant to be added through the dashboard, where the whole
+    // sequence is visible. Preloaded examples buried that under other people's
+    // data and were never asked for.
+    assert.deepEqual(parseTargetsFile(read("targets.json"), 420_000), []);
+  });
+
+  it("keeps a demo pair available for a break that can be caused on cue", () => {
+    // A live break has to be reproducible, and no third-party site will
+    // restructure its markup on request, so the controlled target cannot simply
+    // be deleted. It is opt-in rather than preloaded.
+    const targets = parseTargetsFile(read("targets.demo.json"), 420_000);
 
     assert.ok(targets.length >= 2, "expected at least two targets");
-
-    const external = targets.filter((target) => !target.controllable);
-    const controlled = targets.filter((target) => target.controllable);
-
-    assert.ok(external.length >= 1, "a site we do not control must be monitored");
-    assert.ok(controlled.length >= 1, "a controllable site is needed to demo a break");
+    assert.ok(
+      targets.some((target) => target.controllable),
+      "a controllable site is needed to demo a break",
+    );
+    assert.ok(
+      targets.some((target) => !target.controllable),
+      "a site we do not control proves the pipeline works on the open web",
+    );
 
     for (const target of targets) {
       assert.match(target.collectorId, /^c_/);
