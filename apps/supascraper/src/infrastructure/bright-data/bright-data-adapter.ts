@@ -1,4 +1,8 @@
 import type {
+  CollectorFactory,
+  CreatedCollector,
+} from "../../application/add-target/add-target.js";
+import type {
   CollectorApprover,
   CollectorHealer,
   HealEnvelope,
@@ -9,7 +13,12 @@ import type {
   NormalizedRunResult,
 } from "../../domain/contracts/collector-run.js";
 
-export type BrightDataOperation = "run" | "heal" | "approve" | "reject";
+export type BrightDataOperation =
+  | "run"
+  | "heal"
+  | "approve"
+  | "reject"
+  | "create";
 
 export class BrightDataIntegrationNotConfiguredError extends Error {
   readonly operation: BrightDataOperation;
@@ -30,10 +39,18 @@ export class BrightDataIntegrationNotConfiguredError extends Error {
  * CLI integration has been observed and verified. Every method rejects.
  */
 export class UnconfiguredBrightDataAdapter
-  implements CollectorRunner, CollectorHealer, CollectorApprover
+  implements CollectorRunner, CollectorHealer, CollectorApprover, CollectorFactory
 {
   run(_config: CollectorConfig): Promise<NormalizedRunResult> {
     return Promise.reject(new BrightDataIntegrationNotConfiguredError("run"));
+  }
+
+  create(_input: {
+    readonly url: string;
+    readonly description: string;
+    readonly name: string;
+  }): Promise<CreatedCollector> {
+    return Promise.reject(new BrightDataIntegrationNotConfiguredError("create"));
   }
 
   heal(_collectorId: string, _prompt: string): Promise<HealEnvelope> {

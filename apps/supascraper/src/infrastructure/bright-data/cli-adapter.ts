@@ -1,6 +1,10 @@
 import { spawn } from "node:child_process";
 
 import type {
+  CollectorFactory,
+  CreatedCollector,
+} from "../../application/add-target/add-target.js";
+import type {
   CollectorApprover,
   CollectorHealer,
   HealEnvelope,
@@ -16,6 +20,15 @@ import { parseRunOutput, UnparseableRunOutputError } from "./parse-run-output.js
 
 const MAX_CAPTURED_BYTES = 4 * 1024 * 1024;
 const MAX_HEAL_PROMPT_LENGTH = 1000;
+
+/** How long Bright Data may poll its AI generation before giving up. */
+const CREATE_POLL_TIMEOUT_MS = 15 * 60 * 1000;
+
+/** Retries only cover the concurrent-job cap, so a small budget is enough. */
+const CREATE_MAX_RETRIES = 2;
+
+/** Outer bound covering polling plus any queued retry waits. */
+const CREATE_PROCESS_TIMEOUT_MS = 25 * 60 * 1000;
 
 /** Steps that prove the healed template was actually persisted. See D-015. */
 const SAVE_STEP = "save_new_template";
@@ -182,7 +195,7 @@ export class BrightDataApprovalNotSavedError extends Error {
  * non-zero code on an otherwise successful command.
  */
 export class BrightDataCliAdapter
-  implements CollectorRunner, CollectorHealer, CollectorApprover
+  implements CollectorRunner, CollectorHealer, CollectorApprover, CollectorFactory
 {
   readonly #cli: CliRunner;
   readonly #logger: Logger;
@@ -282,6 +295,62 @@ export class BrightDataCliAdapter
       }
       throw error;
     }
+  }
+
+  /**
+   * Builds a new scraper from a plain-language description.
+   *
+   * Bright Data's AI generation runs for several minutes and can be queued
+   * behind a concurrency cap, so the retry budget is bounded explicitly rather
+   * than left at the CLI default. Without a bound, one queued request could hold
+   * a child process open far longer than the caller expects.
+   */
+  async create(input: {
+    readonly url: string;
+    readonly description: string;
+    readonly name: string;
+  }): Promise<CreatedCollector> {
+    const result = await this.#cli.invoke({
+      command: this.#command,
+      args: this.#args([
+        "scraper",
+        "create",
+        input.url,
+        input.description,
+        "--name",
+        input.name,
+        "--timeout",
+        String(Math.round(CREATE_POLL_TIMEOUT_MS / 1000)),
+        "--max-retries",
+        String(CREATE_MAX_RETRIES),
+        "--json",
+      ]),
+      timeoutMs: CREATE_PROCESS_TIMEOUT_MS,
+    });
+
+    if (result.timedOut) {
+      throw new Error(
+        "Building the scraper took longer than the allowed time. Bright Data may still be working; try again in a few minutes.",
+      );
+    }
+
+    const envelope = readEnvelope(result.stdout);
+    const collectorId = envelope?.["collector_id"];
+
+    // The collector id is the only part of the envelope that matters, and it is
+    // what proves the scraper exists. A missing id is a failure regardless of
+    // what the reported status says.
+    if (typeof collectorId !== "string" || !collectorId.startsWith("c_")) {
+      throw new Error(
+        `Bright Data did not return a scraper for that page: ${
+          sanitizeCliText(result.stderr || result.stdout, 300) ||
+          "no collector id was reported."
+        }`,
+      );
+    }
+
+    this.#logger.info("Built a new collector.", { collectorId });
+    return { collectorId };
   }
 
   async heal(collectorId: string, prompt: string): Promise<HealEnvelope> {

@@ -15,8 +15,12 @@ export interface AppConfig {
   /** Null means no unattended runs. */
   readonly scheduleIntervalMs: number | null;
   readonly apiToken: string | null;
-  /** Every site being monitored. Empty means nothing is configured. */
+  /** Sites defined ahead of time. Sites added at runtime live in the registry. */
   readonly targets: readonly TargetConfig[];
+  /** Where sites added through the dashboard are persisted. */
+  readonly addedTargetsPath: string;
+  /** Run timeout given to a target added at runtime. */
+  readonly defaultRunTimeoutMs: number;
   /** Retained for the single-collector path; prefer `targets`. */
   readonly collector: CollectorConfig | null;
 }
@@ -148,6 +152,10 @@ export function loadConfig(
     host,
     port,
     targets,
+    addedTargetsPath:
+      environment["SUPASCRAPER_ADDED_TARGETS_PATH"] ??
+      "./data/supascraper-targets.json",
+    defaultRunTimeoutMs: defaultTimeout,
     dataPath: environment["SUPASCRAPER_DATA_PATH"] ?? "./data/supascraper-state.json",
     geminiEnabled: parseBoolean(
       environment["SUPASCRAPER_GEMINI_ENABLED"],
