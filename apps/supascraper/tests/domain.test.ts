@@ -404,6 +404,46 @@ describe("classifyRun", () => {
     assert.ok(first.confidence >= 0 && first.confidence <= 1);
   });
 
+  it("never heals a proxy refusal, and says why in plain language", () => {
+    // A 407 means the request never left Bright Data's network, so neither the
+    // URL nor the scraper is implicated and repairing either is wrong.
+    const decision = classifyRun(
+      succeeded([], [
+        {
+          message: "Crawler error: tunneling socket could not be established, statusCode=407",
+          code: null,
+          kind: "proxy_error",
+        },
+      ]),
+      evaluate([]),
+    );
+
+    assert.equal(decision.classification, "transient_error");
+    assert.equal(decision.recommendedAction, "manual_review");
+    assert.match(decision.evidence[0] ?? "", /proxy refused the connection/i);
+    assert.ok(
+      decision.evidence.some((line) => /account, zone, or network/i.test(line)),
+      "the reader needs to know where the problem is",
+    );
+  });
+
+  it("still repairs a genuine selector failure that arrives alongside a proxy blip", () => {
+    // Selector evidence proves the page loaded at least once, so the break is real.
+    const decision = classifyRun(
+      succeeded([], [
+        { message: "tunneling socket could not be established", code: null, kind: "proxy_error" },
+        {
+          message: 'waiting for selector ".price" failed: timeout',
+          code: null,
+          kind: "selector_timeout",
+        },
+      ]),
+      evaluate([]),
+    );
+    assert.equal(decision.classification, "structural_break");
+    assert.equal(decision.recommendedAction, "heal");
+  });
+
   it("holds an unprofiled site to the bootstrap contract only", () => {
     const rows = [{ headline: "Something happened", url: "https://news.test/1" }];
     const decision = classifyRun(

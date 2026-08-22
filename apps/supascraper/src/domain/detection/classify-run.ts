@@ -79,6 +79,22 @@ export function classifyRun(
       };
     }
 
+    // Nothing reached the site, so neither the URL nor the scraper is implicated
+    // and repairing either would be repairing the wrong thing.
+    if (kinds.has("proxy_error")) {
+      return {
+        classification: "transient_error",
+        confidence: 0.9,
+        evidence: [
+          "Bright Data's proxy refused the connection, so the page was never requested.",
+          "This is an account, zone, or network problem rather than a scraper problem.",
+          ...evidence,
+        ],
+        source: "deterministic",
+        recommendedAction: "manual_review",
+      };
+    }
+
     if (kinds.has("unreachable_page")) {
       return {
         classification: "ambiguous",

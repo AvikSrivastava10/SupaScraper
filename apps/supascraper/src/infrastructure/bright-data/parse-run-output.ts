@@ -48,7 +48,29 @@ const UNREACHABLE_MARKERS = [
   "econnreset",
   "econnrefused",
   "dns",
+  // Bright Data writes this without a space, so both spellings are needed.
   "status code",
+  "statuscode",
+];
+
+/**
+ * Messages that mean the request never left Bright Data's network.
+ *
+ * Observed live: `tunneling socket could not be established, statusCode=407`.
+ * A 407 is proxy authentication, so the target site was never contacted. This
+ * previously fell through to `unknown` and the dashboard reported an
+ * "unrecognized extraction failure", which told the reader nothing about the one
+ * thing they needed to know.
+ */
+const PROXY_MARKERS = [
+  "tunneling socket",
+  "statuscode=407",
+  "status code=407",
+  "statuscode: 407",
+  "proxy authentication",
+  "proxy_error",
+  "err_tunnel_connection_failed",
+  "err_proxy_connection_failed",
 ];
 
 export function classifyExtractionError(
@@ -56,6 +78,15 @@ export function classifyExtractionError(
   code: string | null,
 ): ExtractionErrorKind {
   const normalized = message.toLowerCase();
+
+  // Checked before the unreachable markers, because a proxy refusal also
+  // mentions a status code but has an entirely different remedy.
+  if (
+    code === "proxy_error" ||
+    PROXY_MARKERS.some((marker) => normalized.includes(marker))
+  ) {
+    return "proxy_error";
+  }
 
   if (code === "dead_page" || UNREACHABLE_MARKERS.some((marker) => normalized.includes(marker))) {
     return "unreachable_page";

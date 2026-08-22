@@ -21,11 +21,15 @@ export interface SafeRunError {
  *
  * - `unreachable_page`: the page could not be loaded at all, for example a 404.
  *   Healing cannot fix a wrong or dead URL, so this must not trigger a repair.
+ * - `proxy_error`: the request never left Bright Data's network, for example a
+ *   407 from the proxy. The target site was never contacted, so neither the URL
+ *   nor the scraper is implicated and repairing either would be wrong.
  * - `selector_timeout`: the page loaded but the extraction logic no longer
  *   matches it. This is the structural break the project exists to repair.
  */
 export type ExtractionErrorKind =
   | "unreachable_page"
+  | "proxy_error"
   | "selector_timeout"
   | "unknown";
 

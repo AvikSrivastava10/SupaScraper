@@ -22,6 +22,7 @@ import { JsonFileRepository } from "../dist/infrastructure/persistence/json-file
 import { FileTargetRegistry } from "../dist/infrastructure/persistence/target-store.js";
 import { createApplicationServer } from "../dist/presentation/api/server.js";
 import {
+  groupEvents,
   isShowingStaleData,
   renderDashboardPage,
 } from "../dist/presentation/web/dashboard-page.js";
@@ -151,6 +152,45 @@ describe("classifyExtractionError", () => {
   it("treats an unqualified timeout as unknown rather than structural", () => {
     assert.equal(classifyExtractionError("operation timed out", null), "unknown");
     assert.equal(classifyExtractionError("timeout 30000ms exceeded", null), "unknown");
+  });
+
+  it("recognizes the proxy refusal Bright Data actually emits", () => {
+    // Observed live on 2026-08-22 against a user-supplied site. This previously
+    // fell through to "unknown" and the dashboard said "unrecognized extraction
+    // failure", which hid the only fact that mattered: nothing reached the site.
+    assert.equal(
+      classifyExtractionError(
+        "Crawler error: tunneling socket could not be established, statusCode=407",
+        null,
+      ),
+      "proxy_error",
+    );
+  });
+
+  it("recognizes the other proxy failure spellings", () => {
+    const proxyFailures = [
+      "tunneling socket could not be established",
+      "Proxy Authentication Required",
+      "net::ERR_TUNNEL_CONNECTION_FAILED",
+      "statusCode=407",
+    ];
+    for (const message of proxyFailures) {
+      assert.equal(classifyExtractionError(message, null), "proxy_error", message);
+    }
+    assert.equal(classifyExtractionError("anything", "proxy_error"), "proxy_error");
+  });
+
+  it("does not mistake a proxy refusal for a dead page", () => {
+    // Both mention a status code, but one means "fix your URL" and the other
+    // means "fix your Bright Data account". Conflating them misdirects the reader.
+    assert.notEqual(
+      classifyExtractionError("tunneling socket could not be established, statusCode=407", null),
+      "unreachable_page",
+    );
+    assert.equal(
+      classifyExtractionError("The navigation resulted in a dead page (404 status code)", null),
+      "unreachable_page",
+    );
   });
 
   it("recognizes xpath and element waits as selector failures", () => {
@@ -401,26 +441,45 @@ describe("JsonFileRepository", () => {
   });
 });
 
+const RECORDS = [
+  { name: "Motor", sku: "MTR-100", price: 49.95, availability: "in_stock" },
+];
+
+const target = {
+  id: "demo",
+  label: "Demo target",
+  collectorId: "c_test",
+  targetUrl: "https://example.test/catalog",
+  controllable: true,
+  records: RECORDS,
+  collectedAt: new Date().toISOString(),
+  events: [] as unknown[],
+  busy: false,
+  lastError: null,
+  contract: profileContract(RECORDS),
+  provisioning: null,
+};
+
+/** A recorded run, shaped like the events the orchestrator appends. */
+const event = (overrides: Record<string, unknown> = {}) => ({
+  id: "1",
+  collectorId: "c_test",
+  targetUrl: "https://example.test/catalog",
+  state: "healthy",
+  classification: "healthy",
+  confidence: 1,
+  evidence: ["All 1 row(s) satisfy the expected contract."],
+  beforeMetrics: { rowCount: 1, validRowCount: 1, missingByField: {}, nullByField: {} },
+  afterMetrics: null,
+  healPrompt: null,
+  commandOutcome: null,
+  verification: "not_started",
+  createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+  ...overrides,
+});
+
 describe("dashboard rendering", () => {
-  const RECORDS = [
-    { name: "Motor", sku: "MTR-100", price: 49.95, availability: "in_stock" },
-  ];
-
-  const target = {
-    id: "demo",
-    label: "Demo target",
-    collectorId: "c_test",
-    targetUrl: "https://example.test/catalog",
-    controllable: true,
-    records: RECORDS,
-    collectedAt: new Date().toISOString(),
-    events: [],
-    busy: false,
-    lastError: null,
-    contract: profileContract(RECORDS),
-    provisioning: null,
-  };
-
   const page = (state: string, overrides: Record<string, unknown> = {}) =>
     renderDashboardPage({
       configured: true,
@@ -627,6 +686,159 @@ describe("dashboard rendering", () => {
     });
     assert.ok(!html.includes("<img src=x"));
     assert.ok(html.includes("&lt;img"));
+  });
+
+  it("uses no colour, only black, white, and greys", () => {
+    const html = page("healthy");
+    const colours = [...html.matchAll(/#[0-9a-f]{3,6}\b/gi)].map((match) =>
+      match[0].toLowerCase(),
+    );
+    assert.ok(colours.length > 0, "expected the stylesheet to declare colours");
+
+    for (const colour of colours) {
+      const hex =
+        colour.length === 4
+          ? `#${colour[1]}${colour[1]}${colour[2]}${colour[2]}${colour[3]}${colour[3]}`
+          : colour;
+      const r = Number.parseInt(hex.slice(1, 3), 16);
+      const g = Number.parseInt(hex.slice(3, 5), 16);
+      const b = Number.parseInt(hex.slice(5, 7), 16);
+      // A grey has equal channels. Anything else is a hue.
+      assert.ok(r === g && g === b, `${colour} is not greyscale`);
+    }
+  });
+
+  it("puts the page on white and the type in black", () => {
+    const html = page("healthy");
+    assert.match(html, /--paper:#ffffff/);
+    assert.match(html, /--ink:#000000/);
+    assert.match(html, /color-scheme: light/);
+  });
+
+  it("explains a proxy failure instead of showing a bare status code", () => {
+    const html = page("manual_review", {
+      records: [],
+      collectedAt: null,
+      events: [
+        event({
+          classification: "transient_error",
+          state: "manual_review",
+          evidence: [
+            "Bright Data's proxy refused the connection, so the page was never requested.",
+            "This is an account, zone, or network problem rather than a scraper problem.",
+            "Crawler error: tunneling socket could not be established, statusCode=407",
+          ],
+        }),
+      ],
+    });
+
+    assert.match(html, /proxy refused the connection/i);
+    assert.match(html, /Could not connect/);
+    assert.match(html, /Nothing was repaired, because nothing reached the site/i);
+    // The raw message is still available, just no longer the whole story.
+    assert.match(html, /statusCode=407/);
+  });
+
+  it("reads run metrics as a sentence rather than as 0\/0", () => {
+    const empty = page("manual_review", {
+      records: [],
+      collectedAt: null,
+      events: [event({ beforeMetrics: { rowCount: 0, validRowCount: 0, missingByField: {}, nullByField: {} } })],
+    });
+    assert.match(empty, /no rows returned/);
+    assert.ok(!empty.includes("0/0 valid"));
+
+    const partial = page("manual_review", {
+      events: [event({ beforeMetrics: { rowCount: 4, validRowCount: 1, missingByField: {}, nullByField: {} } })],
+    });
+    assert.match(partial, /1 of 4 row\(s\) valid/);
+  });
+
+  it("tells the reader what to do when a break needs a repair", () => {
+    const withHeal = page("suspected", {
+      events: [event({ classification: "structural_break", state: "suspected" })],
+    });
+    assert.match(withHeal, /repair should start automatically/i);
+
+    const withoutHeal = renderDashboardPage({
+      configured: true,
+      autoHealEnabled: false,
+      geminiEnabled: false,
+      scheduleMinutes: null,
+      canAddTargets: true,
+      requiresToken: false,
+      targets: [
+        {
+          ...target,
+          state: "suspected",
+          events: [event({ classification: "structural_break", state: "suspected" })],
+        },
+      ],
+    } as never);
+    assert.match(withoutHeal, /SUPASCRAPER_AUTO_HEAL=true/);
+  });
+
+  it("says plainly that a site has never been collected", () => {
+    const html = page("idle", { records: [], collectedAt: null, events: [] });
+    assert.match(html, /Never collected/);
+    assert.match(html, /Choose Collect now/);
+  });
+});
+
+describe("groupEvents", () => {
+  it("collapses consecutive runs with the same outcome into one entry", () => {
+    // Three identical failures are one fact. Listing each pushed everything
+    // useful off the screen, which is what made the page unreadable.
+    const repeated = [
+      event({ id: "3", createdAt: "2026-08-22T00:02:00Z" }),
+      event({ id: "2", createdAt: "2026-08-22T00:01:00Z" }),
+      event({ id: "1", createdAt: "2026-08-22T00:00:00Z" }),
+    ];
+    const grouped = groupEvents(repeated);
+
+    assert.equal(grouped.length, 1);
+    assert.equal(grouped[0]?.repeats, 3);
+    assert.equal(grouped[0]?.event.id, "3", "the newest event represents the group");
+    assert.equal(grouped[0]?.oldestAt, "2026-08-22T00:00:00Z");
+  });
+
+  it("keeps entries apart when the outcome differs", () => {
+    const mixed = [
+      event({ id: "2", classification: "healthy", state: "healthy" }),
+      event({ id: "1", classification: "structural_break", state: "suspected" }),
+    ];
+    assert.equal(groupEvents(mixed).length, 2);
+  });
+
+  it("keeps entries apart when the evidence differs", () => {
+    const mixed = [
+      event({ id: "2", evidence: ["one reason"] }),
+      event({ id: "1", evidence: ["a different reason"] }),
+    ];
+    assert.equal(groupEvents(mixed).length, 2);
+  });
+
+  it("reports a repeat count on the page", () => {
+    const html = renderDashboardPage({
+      configured: true,
+      autoHealEnabled: true,
+      geminiEnabled: false,
+      scheduleMinutes: null,
+      canAddTargets: true,
+      requiresToken: false,
+      targets: [
+        {
+          ...target,
+          state: "manual_review",
+          events: [event({ id: "2" }), event({ id: "1" })],
+        },
+      ],
+    } as never);
+    assert.match(html, /2 runs, same outcome/);
+  });
+
+  it("handles an empty history", () => {
+    assert.deepEqual(groupEvents([]), []);
   });
 });
 
