@@ -6,6 +6,10 @@ import {
   tableColumns,
   type DataContract,
 } from "../../domain/contracts/data-contract.js";
+import type {
+  PipelineStage,
+  PipelineStep,
+} from "../../domain/progress/pipeline-step.js";
 import type { RepairEvent } from "../../domain/repair/repair-event.js";
 import type { OrchestrationState } from "../../domain/state-machine/state-machine.js";
 import { EXPORT_FORMATS, EXPORT_LABELS } from "../export/export-records.js";
@@ -26,6 +30,8 @@ export interface TargetStatus {
   readonly contract: DataContract | null;
   /** Set while a collector is still being built for a newly added site. */
   readonly provisioning: string | null;
+  /** What the system is doing, or did, on this attempt. */
+  readonly steps: readonly PipelineStep[];
 }
 
 export interface DashboardStatus {
@@ -233,6 +239,67 @@ function describeMetrics(event: RepairEvent): string {
     event.afterMetrics.validRowCount,
     event.afterMetrics.rowCount,
   )} after the repair`;
+}
+
+const STAGE_LABELS: Readonly<Record<PipelineStage, string>> = {
+  validate: "Check the page and the request",
+  build_scraper: "Build the scraper with Bright Data",
+  collect: "Run the collector",
+  read_output: "Read the output",
+  check_contract: "Check it against the contract",
+  classify: "Decide what happened",
+  learn_contract: "Learn the data contract",
+  publish: "Publish the verified data",
+  heal: "Ask Scraper Studio to repair it",
+  review_fix: "Review the proposed fix",
+  apply_fix: "Approve and save the fix",
+  verify: "Re-run and verify recovery",
+};
+
+const STATUS_MARKS: Readonly<Record<PipelineStep["status"], string>> = {
+  started: "…",
+  done: "✓",
+  failed: "✕",
+  skipped: "–",
+};
+
+const STATUS_WORDS: Readonly<Record<PipelineStep["status"], string>> = {
+  started: "in progress",
+  done: "done",
+  failed: "failed",
+  skipped: "not needed",
+};
+
+/**
+ * Shows the steps taken on this attempt, in order.
+ *
+ * This is the answer to "what is it actually doing". A collector build runs for
+ * minutes and a repair longer still, so without this the page could only show a
+ * spinner and then a verdict.
+ */
+function renderSteps(steps: readonly PipelineStep[]): string {
+  if (steps.length === 0) {
+    return `<p class="muted small">Nothing has run yet. The steps appear here as they happen.</p>`;
+  }
+
+  const items = steps
+    .map((step) => {
+      const label = STAGE_LABELS[step.stage] ?? step.stage;
+      return `<li class="step ${step.status}">
+              <span class="mark" aria-hidden="true">${STATUS_MARKS[step.status]}</span>
+              <span class="step-body">
+                <span class="step-name">${escapeHtml(label)}</span>
+                <span class="muted small step-status"> &mdash; ${STATUS_WORDS[step.status]}</span>
+                <span class="muted small step-detail">${escapeHtml(step.detail)}</span>
+              </span>
+              <span class="muted small step-time">${escapeHtml(relativeAge(step.at))}</span>
+            </li>`;
+    })
+    .join("\n");
+
+  return `<ol class="steps">
+${items}
+          </ol>`;
 }
 
 const MAX_CELL_LENGTH = 90;
@@ -492,6 +559,11 @@ function renderTarget(target: TargetStatus, autoHealEnabled: boolean): string {
         </div>
 
         <div class="block">
+          <h3>What the scraper is doing</h3>
+          ${renderSteps(target.steps)}
+        </div>
+
+        <div class="block">
           <h3>Verified data</h3>
           <table>
             <caption>Only output that satisfied the contract appears here.</caption>
@@ -556,6 +628,13 @@ export function renderDashboardPage(status: DashboardStatus): string {
   const busy = status.targets.some(
     (target) => target.busy || target.provisioning !== null,
   );
+
+  // Refresh faster while a step is actually mid-flight, so the sequence reads as
+  // it happens rather than arriving in one jump.
+  const stepInFlight = status.targets.some((target) =>
+    target.steps.some((step) => step.status === "started"),
+  );
+  const refreshSeconds = stepInFlight ? 6 : 15;
   const modes = [
     status.autoHealEnabled ? "auto-repair on" : "auto-repair off",
     status.geminiEnabled ? "Gemini on" : "Gemini off",
@@ -569,7 +648,7 @@ export function renderDashboardPage(status: DashboardStatus): string {
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    ${busy ? `<meta http-equiv="refresh" content="15">` : ""}
+    ${busy ? `<meta http-equiv="refresh" content="${String(refreshSeconds)}">` : ""}
     <title>SupaScraper${busy ? " — working" : ""}</title>
     <style>
       :root { color-scheme: light;
@@ -651,6 +730,23 @@ export function renderDashboardPage(status: DashboardStatus): string {
       details summary { cursor:pointer; color:var(--ink-3); font-size:.8rem;
         margin-top:.3rem; font-weight:600; }
       .contract .fields { display:flex; flex-wrap:wrap; gap:.35rem; }
+
+      ol.steps { list-style:none; margin:0; padding:0; display:grid; gap:.1rem;
+        counter-reset:step; }
+      .step { display:grid; grid-template-columns:1.4rem 1fr auto; gap:.55rem;
+        align-items:baseline; padding:.42rem .5rem; border-bottom:1px solid var(--line); }
+      .step:last-child { border-bottom:none; }
+      .step .mark { font-weight:800; text-align:center; }
+      .step-name { font-weight:650; font-size:.88rem; }
+      .step-detail { display:block; }
+      .step-time { white-space:nowrap; }
+      .step.started { background:var(--wash-2); }
+      .step.started .mark { animation:blink 1.2s steps(3,end) infinite; }
+      .step.skipped .step-name { font-weight:500; color:var(--ink-3); }
+      .step.failed { background:var(--wash); }
+      .step.failed .step-name { text-decoration:underline; text-decoration-thickness:2px; }
+      @keyframes blink { 50% { opacity:.25 } }
+      @media (prefers-reduced-motion:reduce) { .step.started .mark{animation:none} }
 
       .notice { border:1px solid var(--ink); border-left-width:3px; background:var(--wash);
         padding:.6rem .8rem; border-radius:.35rem; margin-top:1rem; font-size:.86rem; }

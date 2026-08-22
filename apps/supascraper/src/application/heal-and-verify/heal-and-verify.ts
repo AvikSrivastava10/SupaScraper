@@ -10,6 +10,11 @@ import type {
 } from "../../domain/contracts/collector-run.js";
 import { rowFingerprint } from "../../domain/detection/compare-baseline.js";
 import type { DetectionDecision } from "../../domain/detection/classify-run.js";
+import {
+  safeReporter,
+  NO_PROGRESS,
+  type ProgressReporter,
+} from "../../domain/progress/pipeline-step.js";
 import type { OrchestrationState } from "../../domain/state-machine/state-machine.js";
 import { transitionState } from "../../domain/state-machine/state-machine.js";
 import type { ScrapedDataStore } from "../process-run/process-run.js";
@@ -62,6 +67,8 @@ export interface HealAndVerifyInput {
   readonly healPrompt: string;
   /** The contract the repaired collector has to satisfy again. */
   readonly contract: DataContract;
+  /** Narrates each repair step, since a repair runs for minutes unattended. */
+  readonly progress?: ProgressReporter;
   /**
    * Last verified data, used to confirm the repaired scraper still returns the
    * same rows rather than merely returning something contract-shaped.
@@ -160,8 +167,15 @@ export async function healAndVerify(
     throw new Error("Only a confirmed structural break may enter healing.");
   }
 
+  const report = safeReporter(input.progress ?? NO_PROGRESS);
+
   const lockToken = await lock.acquire(input.config.collectorId);
   if (lockToken === null) {
+    report({
+      stage: "heal",
+      status: "skipped",
+      detail: "Another repair is already running for this collector.",
+    });
     return {
       status: "already_in_progress",
       finalState: "healing",
@@ -175,12 +189,23 @@ export async function healAndVerify(
   let state: OrchestrationState = transitionState("suspected", "healing");
 
   try {
+    report({
+      stage: "heal",
+      status: "started",
+      detail: "Asking Scraper Studio to repair the collector. This can take several minutes.",
+    });
+
     const envelope = await healer.heal(
       input.config.collectorId,
       input.healPrompt,
     );
 
     if (!reachedApprovalGate(envelope)) {
+      report({
+        stage: "heal",
+        status: "failed",
+        detail: `Repair stopped at status "${envelope.status}" instead of reaching the approval gate.`,
+      });
       return {
         status: "manual_review",
         finalState: transitionState(state, "manual_review"),
@@ -191,10 +216,27 @@ export async function healAndVerify(
       };
     }
 
+    report({
+      stage: "heal",
+      status: "done",
+      detail: `A fix is proposed and waiting for approval. ${envelope.diffSummary ?? ""}`.trim(),
+    });
+
     state = transitionState(state, "awaiting_approval");
+
+    report({
+      stage: "review_fix",
+      status: "started",
+      detail: "Checking the proposed fix against this site's contract before committing it.",
+    });
 
     const review = reviewer.review(envelope, input.contract);
     if (!review.plausible) {
+      report({
+        stage: "review_fix",
+        status: "failed",
+        detail: `Rejected without applying it. ${review.evidence[0] ?? ""}`.trim(),
+      });
       await approver.reject(input.config.collectorId);
       return {
         status: "manual_review",
@@ -206,8 +248,27 @@ export async function healAndVerify(
       };
     }
 
+    report({
+      stage: "review_fix",
+      status: "done",
+      detail: review.evidence[0] ?? "The proposed fix satisfies the contract.",
+    });
+
     await approver.approve(input.config.collectorId);
+
+    report({
+      stage: "apply_fix",
+      status: "done",
+      detail: "Fix approved and saved to the same collector.",
+    });
+
     state = transitionState(state, "verifying");
+
+    report({
+      stage: "verify",
+      status: "started",
+      detail: "Re-running the same collector. Recovery only counts if this run satisfies the contract.",
+    });
 
     // Approval commits the change. Recovery still has to be earned by a run.
     const verificationRun = await runner.run(input.config);
@@ -217,6 +278,11 @@ export async function healAndVerify(
       verificationRun.targetUrl === input.config.targetUrl;
 
     if (!sameCollector) {
+      report({
+        stage: "verify",
+        status: "failed",
+        detail: "The verification run did not target the same collector and URL.",
+      });
       return {
         status: "manual_review",
         finalState: transitionState(state, "manual_review"),
@@ -229,6 +295,11 @@ export async function healAndVerify(
     }
 
     if (verificationRun.status !== "succeeded" || !evaluation.valid) {
+      report({
+        stage: "verify",
+        status: "failed",
+        detail: `The repaired collector still does not satisfy the contract: ${String(evaluation.metrics.validRowCount)} of ${String(evaluation.metrics.rowCount)} row(s) valid.`,
+      });
       return {
         status: "manual_review",
         finalState: transitionState(state, "manual_review"),
@@ -249,6 +320,11 @@ export async function healAndVerify(
         input.contract,
       );
       if (overlap < MIN_BASELINE_OVERLAP) {
+        report({
+          stage: "verify",
+          status: "failed",
+          detail: `Only ${String(Math.round(overlap * 100))}% of previously known rows came back, so the repair may be reading the wrong element.`,
+        });
         return {
           status: "manual_review",
           finalState: transitionState(state, "manual_review"),
@@ -265,6 +341,12 @@ export async function healAndVerify(
       evaluation.acceptedRecords,
       verificationRun.finishedAt,
     );
+
+    report({
+      stage: "verify",
+      status: "done",
+      detail: `Recovered. The same collector returned ${String(evaluation.acceptedRecords.length)} verified row(s) again.`,
+    });
 
     return {
       status: "recovered",

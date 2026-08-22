@@ -21,6 +21,7 @@ import { orderedFields } from "../../domain/contracts/data-contract.js";
 import type { GeminiReasoner } from "../../infrastructure/gemini/gemini-adapter.js";
 import type { Logger } from "../../infrastructure/logging/logger.js";
 import type { DashboardDataReader } from "../../infrastructure/persistence/in-memory-repository.js";
+import { InMemoryActivityLog } from "../../infrastructure/persistence/activity-log.js";
 import { exportRecords, isExportFormat, EXPORT_FORMATS } from "../export/export-records.js";
 import {
   renderDashboardPage,
@@ -115,6 +116,10 @@ export function createApplicationServer(
   const active = new Map<string, Promise<void>>();
   const errors = new Map<string, string>();
 
+  // Live progress, so a build or repair that runs for minutes is observable
+  // rather than a spinner followed by a verdict.
+  const activity = new InMemoryActivityLog();
+
   const autoHealEnabled = config.autoHealEnabled && repair !== undefined;
 
   const requireToken = (
@@ -156,6 +161,7 @@ export function createApplicationServer(
       lastError: errors.get(target.id) ?? null,
       contract,
       provisioning: null,
+      steps: activity.list(target.id),
     };
   };
 
@@ -178,6 +184,7 @@ export function createApplicationServer(
         entry.status === "failed"
           ? null
           : "Bright Data is building a scraper for this page. This usually takes 5 to 10 minutes.",
+      steps: activity.list(entry.id),
     }));
 
   const buildStatus = async (): Promise<DashboardStatus> => {
@@ -207,11 +214,33 @@ export function createApplicationServer(
     }
 
     errors.delete(target.id);
+    const report = activity.reporterFor(target.id);
+
     const work = (async () => {
+      // A fresh sequence per run, so the display shows this attempt rather than
+      // an ever-growing log the reader has to scroll.
+      activity.begin(target.id);
+      report({
+        stage: "collect",
+        status: "started",
+        detail: `Running collector ${target.collectorId} against ${target.targetUrl}.`,
+      });
+
       const run = await runCollector(target, runner);
+
+      report({
+        stage: "collect",
+        status: run.status === "succeeded" ? "done" : "failed",
+        detail:
+          run.status === "succeeded"
+            ? "The collector finished and returned output."
+            : (run.safeError?.message ?? `The run ended as ${run.status}.`),
+      });
+
       await processCollectorRun(run, repository, repository, {
         autoHealEnabled,
         config: target,
+        progress: report,
         ...(repair === undefined ? {} : { repair }),
         ...(reasoner === undefined ? {} : { reasoner }),
       });
@@ -220,6 +249,7 @@ export function createApplicationServer(
         const message =
           error instanceof Error ? error.message : "The collector run failed.";
         errors.set(target.id, message);
+        report({ stage: "collect", status: "failed", detail: message });
         logger.error("Collector run failed.", {
           target: target.id,
           collectorId: target.collectorId,
@@ -334,6 +364,12 @@ export function createApplicationServer(
           // without the user having to press anything.
           onReady: (target) => {
             beginRun(target);
+          },
+          // Provisioning steps are recorded against the new target's id, which
+          // add-target derives, so the reporter has to be built after validation.
+          progressFor: (targetId) => {
+            activity.begin(targetId);
+            return activity.reporterFor(targetId);
           },
         },
       );

@@ -1,4 +1,9 @@
 import type { TargetConfig } from "../../config/targets.js";
+import {
+  safeReporter,
+  NO_PROGRESS,
+  type ProgressReporter,
+} from "../../domain/progress/pipeline-step.js";
 import type { Logger } from "../../infrastructure/logging/logger.js";
 import type { PendingTarget, TargetRegistry } from "./target-registry.js";
 import { SiteInputError, validateSite, type SiteInput } from "./validate-site.js";
@@ -24,6 +29,12 @@ export interface AddTargetDependencies {
   readonly timeoutMs: number;
   /** Called once the scraper is ready, so the caller can collect immediately. */
   readonly onReady?: (target: TargetConfig) => void;
+  /**
+   * Narrates provisioning. Bound to the derived target id, which is why it is a
+   * factory rather than a plain reporter: the id is not known until validation
+   * has run.
+   */
+  readonly progressFor?: (targetId: string) => ProgressReporter;
 }
 
 export interface AddTargetResult {
@@ -46,13 +57,21 @@ export function addTarget(
   input: SiteInput,
   dependencies: AddTargetDependencies,
 ): AddTargetResult {
-  const { registry, factory, logger, timeoutMs, onReady } = dependencies;
+  const { registry, factory, logger, timeoutMs, onReady, progressFor } = dependencies;
 
   const site = validateSite(input, (id) => registry.isTaken(id));
 
   if (registry.hasUrl(site.url)) {
     throw new SiteInputError("That page is already being monitored.");
   }
+
+  const report = safeReporter(progressFor?.(site.id) ?? NO_PROGRESS);
+
+  report({
+    stage: "validate",
+    status: "done",
+    detail: `${site.url} accepted as a public page. Extracting: ${site.description}`,
+  });
 
   const pending: PendingTarget = {
     id: site.id,
@@ -70,6 +89,12 @@ export function addTarget(
     url: site.url,
   });
 
+  report({
+    stage: "build_scraper",
+    status: "started",
+    detail: "Bright Data's AI is writing a scraper from that description. Usually 5 to 10 minutes.",
+  });
+
   const completion = (async () => {
     try {
       const created = await factory.create({
@@ -79,6 +104,11 @@ export function addTarget(
       });
 
       const target = registry.resolvePending(site.id, created.collectorId, timeoutMs);
+      report({
+        stage: "build_scraper",
+        status: "done",
+        detail: `Scraper built as collector ${created.collectorId}. Every later repair reuses this same id.`,
+      });
       logger.info("Scraper is ready.", {
         target: target.id,
         collectorId: target.collectorId,
@@ -90,6 +120,7 @@ export function addTarget(
           ? error.message
           : "The scraper could not be built for this page.";
       registry.failPending(site.id, message);
+      report({ stage: "build_scraper", status: "failed", detail: message });
       logger.error("Could not build a scraper for the added site.", {
         target: site.id,
         reason: message,

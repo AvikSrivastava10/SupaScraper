@@ -20,6 +20,11 @@ import {
 import { buildHealPrompt } from "../../domain/repair/heal-prompt.js";
 import type { GeminiReasoner } from "../../infrastructure/gemini/gemini-adapter.js";
 import { mergeReasoning } from "../../infrastructure/gemini/gemini-adapter.js";
+import {
+  safeReporter,
+  NO_PROGRESS,
+  type ProgressReporter,
+} from "../../domain/progress/pipeline-step.js";
 import type { RepairEvent, VerificationStatus } from "../../domain/repair/repair-event.js";
 import type { OrchestrationState } from "../../domain/state-machine/state-machine.js";
 import type {
@@ -73,6 +78,8 @@ export interface ProcessRunOptions {
   readonly repair?: HealAndVerifyDependencies;
   /** Optional second opinion. Never required, never able to widen permission. */
   readonly reasoner?: GeminiReasoner;
+  /** Narrates each step so the work is visible while it runs. */
+  readonly progress?: ProgressReporter;
 }
 
 /**
@@ -122,11 +129,30 @@ export async function processCollectorRun(
   eventStore: RepairEventStore,
   options: ProcessRunOptions = {},
 ): Promise<ProcessRunResult> {
+  const report = safeReporter(options.progress ?? NO_PROGRESS);
+
+  report({
+    stage: "read_output",
+    status: run.status === "succeeded" ? "done" : "failed",
+    detail:
+      run.status === "succeeded"
+        ? `${String(run.records.length)} data row(s) and ${String(run.extractionErrors.length)} extraction error(s).`
+        : (run.safeError?.message ?? `The run ended as ${run.status}.`),
+  });
+
   // A site the system has never scraped successfully has no contract yet, so it
   // is judged against the universal minimum until a good run can teach it one.
   const stored = await dataStore.getContract(run.collectorId);
   const contract = stored ?? BOOTSTRAP_CONTRACT;
   const evaluation = evaluateContract(run.records, contract);
+
+  report({
+    stage: "check_contract",
+    status: evaluation.valid ? "done" : "failed",
+    detail: stored === null
+      ? `No contract yet, so only the universal minimum was checked. ${String(evaluation.metrics.validRowCount)} of ${String(evaluation.metrics.rowCount)} row(s) usable.`
+      : `${String(evaluation.metrics.validRowCount)} of ${String(evaluation.metrics.rowCount)} row(s) satisfied the learned contract.`,
+  });
 
   // The previously verified data is the only reference that can distinguish a
   // real data change from a partially broken extraction.
@@ -149,6 +175,14 @@ export async function processCollectorRun(
     decision = mergeReasoning(deterministic, opinion);
   }
 
+  report({
+    stage: "classify",
+    status: "done",
+    detail: `${decision.classification.replaceAll("_", " ")} at ${String(
+      Math.round(decision.confidence * 100),
+    )}% confidence. ${decision.evidence[0] ?? ""}`.trim(),
+  });
+
   const publishable =
     decision.recommendedAction === "publish" && evaluation.valid && run.records.length > 0;
 
@@ -167,7 +201,34 @@ export async function processCollectorRun(
     if (stored === null) {
       learnedContract = profileContract(evaluation.acceptedRecords);
       await dataStore.saveContract(run.collectorId, learnedContract);
+      report({
+        stage: "learn_contract",
+        status: "done",
+        detail: `Learned from this run: ${learnedContract.requiredFields.join(", ") || "no consistently present fields"}${
+          learnedContract.identityField === null
+            ? ""
+            : `, identified by ${learnedContract.identityField}`
+        }.`,
+      });
+    } else {
+      report({
+        stage: "learn_contract",
+        status: "skipped",
+        detail: "A contract was already learned for this site.",
+      });
     }
+
+    report({
+      stage: "publish",
+      status: "done",
+      detail: `${String(evaluation.acceptedRecords.length)} verified row(s) published.`,
+    });
+  } else {
+    report({
+      stage: "publish",
+      status: "skipped",
+      detail: `Nothing published: the run was classified as ${decision.classification.replaceAll("_", " ")}.`,
+    });
   }
 
   let repair: HealAndVerifyOutcome | null = null;
@@ -194,6 +255,7 @@ export async function processCollectorRun(
         decision,
         healPrompt,
         contract,
+        progress: report,
         ...(previous === null ? {} : { baseline: previous.records }),
       },
       options.repair,
