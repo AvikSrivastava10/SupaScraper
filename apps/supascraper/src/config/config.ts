@@ -10,6 +10,15 @@ export interface AppConfig {
   readonly port: number;
   readonly dataPath: string;
   readonly geminiEnabled: boolean;
+  /**
+   * Which Gemini model to call.
+   *
+   * Configurable because Google retires these on a schedule. The previous
+   * default, `gemini-2.0-flash`, was shut down on 1 June 2026 and the failure was
+   * invisible: every Gemini error degrades to "no opinion", so a dead model name
+   * looks exactly like a model that had nothing to add.
+   */
+  readonly geminiModel: string;
   /** Off unless explicitly enabled: healing mutates a hosted collector. */
   readonly autoHealEnabled: boolean;
   /** Null means no unattended runs. */
@@ -24,6 +33,9 @@ export interface AppConfig {
   /** Retained for the single-collector path; prefer `targets`. */
   readonly collector: CollectorConfig | null;
 }
+
+/** Google's stated replacement for the retired `gemini-2.0-flash`. */
+export const DEFAULT_GEMINI_MODEL = "gemini-3.6-flash";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 
@@ -161,6 +173,7 @@ export function loadConfig(
       environment["SUPASCRAPER_GEMINI_ENABLED"],
       "SUPASCRAPER_GEMINI_ENABLED",
     ),
+    geminiModel: environment["SUPASCRAPER_GEMINI_MODEL"]?.trim() || DEFAULT_GEMINI_MODEL,
     autoHealEnabled: parseBoolean(
       environment["SUPASCRAPER_AUTO_HEAL"],
       "SUPASCRAPER_AUTO_HEAL",

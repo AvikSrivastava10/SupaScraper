@@ -70,7 +70,8 @@ export function startApplication(): void {
     if (apiKey === undefined || apiKey.trim().length === 0) {
       logger.info("Gemini is enabled but no API key is set; continuing without it.");
     } else {
-      reasoner = new HttpGeminiReasoner({ apiKey }, logger);
+      reasoner = new HttpGeminiReasoner({ apiKey, model: config.geminiModel }, logger);
+      logger.info("Gemini reasoning is enabled.", { model: config.geminiModel });
     }
   }
 

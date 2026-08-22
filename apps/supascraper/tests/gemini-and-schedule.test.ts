@@ -20,7 +20,7 @@ import {
   evaluateContract,
   profileContract,
 } from "../dist/domain/contracts/data-contract.js";
-import { loadConfig } from "../dist/config/config.js";
+import { DEFAULT_GEMINI_MODEL, loadConfig } from "../dist/config/config.js";
 import type { DetectionDecision } from "../dist/domain/detection/classify-run.js";
 import type { NormalizedRunResult } from "../dist/domain/contracts/collector-run.js";
 
@@ -88,6 +88,88 @@ describe("buildReasoningPayload", () => {
       evaluation: evaluateContract(many, CONTRACT),
     });
     assert.equal((payload["sampleRows"] as unknown[]).length, 3);
+  });
+});
+
+describe("Gemini model configuration", () => {
+  it("defaults to a model that has not been retired", () => {
+    // gemini-2.0-flash was shut down on 1 June 2026. Because every Gemini
+    // failure degrades to "no opinion", the dead model name was invisible.
+    assert.equal(DEFAULT_GEMINI_MODEL, "gemini-3.6-flash");
+    assert.equal(loadConfig({}).geminiModel, DEFAULT_GEMINI_MODEL);
+  });
+
+  it("can be pointed at another model without a code change", () => {
+    assert.equal(
+      loadConfig({ SUPASCRAPER_GEMINI_MODEL: "gemini-3.5-flash-lite" }).geminiModel,
+      "gemini-3.5-flash-lite",
+    );
+  });
+
+  it("ignores a blank override rather than calling an empty model name", () => {
+    assert.equal(loadConfig({ SUPASCRAPER_GEMINI_MODEL: "   " }).geminiModel, DEFAULT_GEMINI_MODEL);
+  });
+
+  it("calls the configured model on the generateContent endpoint", async () => {
+    const seen: string[] = [];
+    const reasoner = new HttpGeminiReasoner(
+      {
+        apiKey: "k",
+        model: "gemini-3.6-flash",
+        fetchImpl: (url) => {
+          seen.push(String(url));
+          return Promise.resolve(new Response("{}", { status: 200 }));
+        },
+      },
+      SILENT,
+    );
+
+    await reasoner.reason(context());
+    assert.match(seen[0] ?? "", /\/gemini-3\.6-flash:generateContent$/);
+  });
+
+  it("reports a retired or misspelled model loudly instead of swallowing it", async () => {
+    // Silence here would mean the reasoning layer could be dead for months while
+    // looking exactly like a model that had nothing to add.
+    const errors: { message: string; details?: unknown }[] = [];
+    const reasoner = new HttpGeminiReasoner(
+      {
+        apiKey: "k",
+        model: "gemini-2.0-flash",
+        fetchImpl: () => Promise.resolve(new Response("not found", { status: 404 })),
+      },
+      {
+        info: () => undefined,
+        error: (message: string, details?: unknown) => {
+          errors.push({ message, details });
+        },
+      },
+    );
+
+    assert.equal(await reasoner.reason(context()), null, "it must still degrade safely");
+    assert.equal(errors.length, 1);
+    assert.match(errors[0]?.message ?? "", /model not found/i);
+    assert.match(errors[0]?.message ?? "", /SUPASCRAPER_GEMINI_MODEL/);
+    assert.deepEqual(errors[0]?.details, { model: "gemini-2.0-flash" });
+  });
+
+  it("still degrades quietly for an ordinary rate limit", async () => {
+    const errors: string[] = [];
+    const reasoner = new HttpGeminiReasoner(
+      {
+        apiKey: "k",
+        fetchImpl: () => Promise.resolve(new Response("slow down", { status: 429 })),
+      },
+      {
+        info: () => undefined,
+        error: (message: string) => {
+          errors.push(message);
+        },
+      },
+    );
+
+    assert.equal(await reasoner.reason(context()), null);
+    assert.deepEqual(errors, [], "a transient failure is not a configuration fault");
   });
 });
 

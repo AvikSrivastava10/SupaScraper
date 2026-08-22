@@ -318,6 +318,7 @@ See [.env.example](./.env.example) for the full list. Nothing secret belongs in 
 | `SUPASCRAPER_AUTO_HEAL` | Enables unattended repair; off by default |
 | `SUPASCRAPER_SCHEDULE_MINUTES` | Unattended run interval; empty for none, minimum 5 |
 | `SUPASCRAPER_GEMINI_ENABLED` | Enables the second-opinion layer |
+| `SUPASCRAPER_GEMINI_MODEL` | Which Gemini model to call; defaults to `gemini-3.6-flash` |
 | `SUPASCRAPER_HOST` / `SUPASCRAPER_API_TOKEN` | Loopback by default; a non-loopback bind requires a token |
 | `SUPASCRAPER_TARGETS_PATH` | Sites to preload. Empty by default; point at `targets.demo.json` for the break demo |
 | `SUPASCRAPER_DATA_PATH` | Where verified data, learned contracts, and repair history persist |
@@ -342,6 +343,8 @@ Every run is classified deterministically before anything else happens, in a del
 | Valid rows, unchanged | `healthy` | Publish |
 
 Gemini, when enabled, is consulted only for `ambiguous` and `structural_break` verdicts. It can add evidence and it can downgrade a repair to manual review, but it can never escalate anything into a repair. The deterministic result always sets the ceiling.
+
+Every Gemini failure — no key, no network, a timeout, an unparseable answer — becomes "no opinion", and the deterministic result carries on alone. The one exception is a `404`: that means the model name is wrong or retired, which will never fix itself, so it is logged as an error rather than swallowed. Google retires these on a schedule, which is why the model is configurable.
 
 ## Scripts
 

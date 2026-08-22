@@ -1,3 +1,4 @@
+import { DEFAULT_GEMINI_MODEL } from "../../config/config.js";
 import type { ContractEvaluation } from "../../domain/contracts/data-contract.js";
 import type { NormalizedRunResult } from "../../domain/contracts/collector-run.js";
 import type {
@@ -170,7 +171,7 @@ export class HttpGeminiReasoner implements GeminiReasoner {
 
   constructor(options: GeminiOptions, logger: Logger) {
     this.#apiKey = options.apiKey;
-    this.#model = options.model ?? "gemini-2.0-flash";
+    this.#model = options.model ?? DEFAULT_GEMINI_MODEL;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
     this.#endpoint =
       options.endpoint ?? "https://generativelanguage.googleapis.com/v1beta/models";
@@ -209,9 +210,22 @@ export class HttpGeminiReasoner implements GeminiReasoner {
       );
 
       if (!response.ok) {
-        this.#logger.info("Gemini declined to answer; using deterministic result.", {
-          status: response.status,
-        });
+        // A 404 means the model name is wrong or has been retired, which is a
+        // configuration fault that will never fix itself. Every other Gemini
+        // failure degrades quietly by design, so without this the reasoning layer
+        // could be dead for months and look exactly like a model with nothing to
+        // add. Google shut down gemini-2.0-flash on 1 June 2026 and this project
+        // did not notice.
+        if (response.status === 404) {
+          this.#logger.error(
+            "Gemini model not found. Reasoning is disabled until this is corrected. Set SUPASCRAPER_GEMINI_MODEL to a current model.",
+            { model: this.#model },
+          );
+        } else {
+          this.#logger.info("Gemini declined to answer; using deterministic result.", {
+            status: response.status,
+          });
+        }
         return null;
       }
 
