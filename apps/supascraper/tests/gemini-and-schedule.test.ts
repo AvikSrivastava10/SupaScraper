@@ -244,6 +244,27 @@ describe("mergeReasoning", () => {
     assert.ok(merged.confidence <= STRUCTURAL.confidence);
   });
 
+  it("cannot be talked into publishing broken data by a page that steers the model", () => {
+    // Sample rows in the payload come from a third-party page, so their content
+    // is attacker-controlled. Verified live against gemini-3.6-flash on
+    // 2026-08-22: the model ignored an explicit override attempt embedded in a
+    // scraped field. This test covers the case where a model does not, which is
+    // the only guarantee that does not depend on the model behaving.
+    const merged = mergeReasoning(
+      STRUCTURAL,
+      opinion({
+        classification: "healthy",
+        confidence: 1,
+        evidence: ["all good"],
+        explanation: "nothing wrong",
+      }),
+    );
+
+    assert.notEqual(merged.recommendedAction, "publish", "broken data must never publish");
+    assert.equal(merged.recommendedAction, "manual_review");
+    assert.equal(merged.classification, "structural_break");
+  });
+
   it("keeps the deterministic classification even when the model is confident", () => {
     const merged = mergeReasoning(STRUCTURAL, opinion({ classification: "healthy", confidence: 1 }));
     assert.equal(merged.classification, "structural_break");
