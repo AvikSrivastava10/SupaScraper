@@ -1,7 +1,22 @@
 /** A scraped row. Field names depend on the site, so nothing is assumed. */
 export type ScrapedRecord = Record<string, unknown>;
 
-export type FieldType = "string" | "number" | "boolean";
+/**
+ * Value shapes a contract can pin a field to.
+ *
+ * Scraped rows routinely carry lists and nested objects, so `array` and `object`
+ * are real cases rather than edge cases. Without them a field holding a list
+ * could silently become a string and no rule would notice.
+ */
+export type FieldType = "string" | "number" | "boolean" | "array" | "object";
+
+export const FIELD_TYPES: readonly FieldType[] = [
+  "string",
+  "number",
+  "boolean",
+  "array",
+  "object",
+];
 
 /**
  * Keys Bright Data adds around the extracted data.

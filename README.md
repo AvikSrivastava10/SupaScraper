@@ -8,6 +8,8 @@ SupaScraper watches a collector's **output contract** rather than its exit code.
 
 > Same Collector ID. Same data contract. No downstream code change.
 
+Point it at any public page. Bright Data builds the scraper from your plain-language description, and SupaScraper learns that site's data contract from the first run it publishes — so there is nothing to configure and no schema to write. Verified rows download as JSON, JSON Lines, CSV, TSV, XML, Markdown, or HTML.
+
 ## Project status
 
 Built for the WeMakeDevs "Into the Scrape-Verse" hackathon (17–23 August 2026). This is work in progress, and the table below reflects what is actually verified rather than what is planned.
@@ -15,19 +17,21 @@ Built for the WeMakeDevs "Into the Scrape-Verse" hackathon (17–23 August 2026)
 | Area | Status |
 |---|---|
 | Bright Data CLI capability audit | Verified against CLI `0.3.5` |
-| Controlled target site with switchable failure scenarios | Implemented, durable across restarts |
-| Public deployment of the target | Configuration ready, not yet deployed |
+| Controlled target site with switchable failure scenarios | Verified, durable across restarts |
+| Public deployment of the target | Deployed at `supascraper-target.onrender.com` |
 | Scrapes a real site we do not control | Verified; 11 books from books.toscrape.com |
-| Monitors several sites at once | Verified; per-target history, guards, and dashboard |
+| Monitors several sites at once | Verified; per-target contract, history, and guards |
 | Break, heal, approve, recover against a live collector | Verified end to end; recovered data byte-identical to baseline |
-| Collector integration inside the app | Adapter deliberately fails closed; not wired into the running server yet |
-| Contract validation and run classification | Implemented and unit-tested |
+| Collector integration inside the app | Verified; live runs publish through the real CLI adapter |
+| Works on a site with no fixed schema | Verified; the contract is profiled from the first published run |
+| Add a site from the dashboard | Verified; `POST /api/targets` builds a collector in the background |
+| Export verified data | Verified live; JSON, JSON Lines, CSV, TSV, XML, Markdown, HTML |
 | Unattended heal → review → approve → verify | Verified live; a real break repaired itself and rows went 0/0 to 3/3 |
 | Tells a data change from a broken extraction | Verified live; changed prices published without any repair |
 | Gemini second opinion | Implemented and unit-tested; needs `GEMINI_API_KEY` to run live |
 | Scheduled unattended runs | Implemented, opt-in, five-minute floor |
-| Dashboard | Catalog, status, freshness, repair timeline, generated prompt |
-| Automated test suite | 197 tests, no test framework dependency |
+| Dashboard | Add-site form, dynamic columns, downloads, repair timeline, generated prompt |
+| Automated test suite | 339 tests, no test framework dependency |
 
 Automatic repair is off unless `SUPASCRAPER_AUTO_HEAL=true`, and the repair dependencies are only assembled when it is enabled, so no accidental code path can mutate a hosted collector.
 
@@ -36,17 +40,17 @@ The Bright Data adapter intentionally throws rather than pretending to work, so 
 ## How it fits together
 
 ```text
-Public controlled target  ──scraped by──▶  Bright Data collector (c_*)
+Any public page  ──described in plain language──▶  Bright Data builds a collector (c_*)
                                                     │ structured JSON
                                                     ▼
                                           SupaScraper orchestrator
-                                          ├─ contract profiler
+                                          ├─ contract profiler   (learns the shape once)
                                           ├─ deterministic detector
                                           ├─ optional Gemini reasoning
                                           └─ heal / approve / verify
                                                     │ verified data only
                                                     ▼
-                                          Downstream catalog view
+                                          Dashboard  +  JSON/CSV/XML/… export
 ```
 
 Bright Data owns scraper generation, execution, proxying, unblocking, and healing. SupaScraper adds only the judgment and verification layer around it.
@@ -74,6 +78,60 @@ The controlled site exists because a demo needs a break you can cause, reverse, 
 Both were healed by the system itself. The real site's collector initially omitted `price` and returned unnormalised availability; SupaScraper classified that as a structural break, repaired it, verified the repair, and published eleven books.
 
 The controlled site runs on a free instance that idles out, so warm it before a demo.
+
+These two are only the seeds. Anything you add from the dashboard joins them.
+
+## Adding a website
+
+Paste a URL into the dashboard, describe what you want in plain language, and press **Build scraper**. Or do it over HTTP:
+
+```bash
+curl -X POST http://localhost:3000/api/targets \
+  -H "Content-Type: application/json" \
+  -d '{
+        "url": "https://quotes.toscrape.com/",
+        "description": "For each quote, extract the quote text, the author name, and the tags as a list.",
+        "label": "Quotes to Scrape"
+      }'
+```
+
+The response is immediate (`202`) because Bright Data's AI needs roughly 5–10 minutes to build a scraper. The site appears on the dashboard as *building* the whole time, and collects itself as soon as the collector exists. A build failure is reported against the site rather than lost.
+
+**No schema, no selectors, no configuration.** The first run that satisfies validation defines that site's contract:
+
+- **Required fields** are the ones present and non-empty in *every* row. A field only some rows carried stays optional, so a legitimately blank value cannot fail a later run.
+- **Types** come from the data.
+- **An identity field** is chosen from conventional names (`sku`, `upc`, `isbn`, `id`, …), then from any field whose values are unique. This is what makes duplicate detection and row-level change comparison possible.
+
+Until that first good run, a site is held only to what is true of scraped data everywhere: at least one row, and every row carrying at least one real value.
+
+The contract is shown on the dashboard, so the guarantee being enforced is visible rather than implied.
+
+Submitted URLs must be public HTTPS pages. Loopback, private, link-local, and cloud-metadata addresses are refused, as are credentials embedded in a URL. Only scrape data you are permitted to collect.
+
+## Exporting the data
+
+Every target offers its verified rows in seven formats:
+
+```bash
+curl -OJ "http://localhost:3000/api/targets/books/export?format=csv"
+```
+
+| Format | `?format=` | Use |
+|---|---|---|
+| JSON | `json` | Pretty-printed array |
+| JSON Lines | `jsonl` | One object per line, for streaming |
+| CSV | `csv` | RFC 4180, opens in any spreadsheet |
+| TSV | `tsv` | Tab-separated |
+| XML | `xml` | Field names carried as attributes |
+| Markdown | `md` | A table you can paste into a document |
+| HTML | `html` | A standalone page |
+
+Columns come from the rows themselves, so any site exports without configuration, and every field is included rather than only the ones the contract requires.
+
+CSV and TSV neutralise values a spreadsheet would execute as a formula, because the data comes from third-party pages. A leading minus is only guarded when the value is not a number, so real negative values survive intact.
+
+Only data that satisfied its contract is ever exported. There is no endpoint that returns unverified output.
 
 ## Prerequisites
 
@@ -152,7 +210,9 @@ The service reads `PORT` when a platform injects one and falls back to `TARGET_S
 
 Scenario state lives on an ephemeral filesystem by design, so a redeploy returns the target to `baseline`.
 
-## Working with a collector
+## Working with a collector by hand
+
+The dashboard does all of this for you. Reach for the CLI directly when you want a collector that outlives a particular deployment's data directory, or when you are debugging.
 
 Create a scraper once, from a plain-language description with no hardcoded selectors. Generation typically takes 5–10 minutes:
 
@@ -235,7 +295,9 @@ See [.env.example](./.env.example) for the full list. Nothing secret belongs in 
 | `SUPASCRAPER_SCHEDULE_MINUTES` | Unattended run interval; empty for none, minimum 5 |
 | `SUPASCRAPER_GEMINI_ENABLED` | Enables the second-opinion layer |
 | `SUPASCRAPER_HOST` / `SUPASCRAPER_API_TOKEN` | Loopback by default; a non-loopback bind requires a token |
-| `SUPASCRAPER_DATA_PATH` | Where verified data and repair history persist |
+| `SUPASCRAPER_TARGETS_PATH` | Committed file defining the seeded sites |
+| `SUPASCRAPER_DATA_PATH` | Where verified data, learned contracts, and repair history persist |
+| `SUPASCRAPER_ADDED_TARGETS_PATH` | Where sites added from the dashboard persist |
 | `BRIGHTDATA_API_KEY` | Optional; only for non-interactive runs |
 | `GEMINI_API_KEY` | Optional; reasoning layer |
 | `TARGET_CONTROL_TOKEN` | Protects the scenario control route |
@@ -266,10 +328,11 @@ Gemini, when enabled, is consulted only for `ambiguous` and `structural_break` v
 | `npm run verify` | Build and test in one step |
 | `npm run typecheck` | Type check without emitting |
 | `npm run clean` | Remove build output |
-
-Tests use Node's built-in runner with no test framework dependency. They run against compiled output, so `npm test` builds first.
 | `npm run start:target` | Run the demo target |
 | `npm run start:app` | Run the SupaScraper app |
+| `npm run layout <mode>` | Switch the demo target's failure scenario |
+
+Tests use Node's built-in runner with no test framework dependency. They run against compiled output, so `npm test` builds first.
 
 ## Scheduled runs
 

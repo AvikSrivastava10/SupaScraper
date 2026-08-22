@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import type { FieldType, ScrapedRecord } from "@supascraper/shared";
+import { FIELD_TYPES, type FieldType, type ScrapedRecord } from "@supascraper/shared";
 
 import type { CollectorLock } from "../../application/heal-and-verify/heal-and-verify.js";
 import type {
@@ -32,7 +32,7 @@ const EMPTY: PersistedState = {
   events: [],
 };
 
-const FIELD_TYPES = new Set<string>(["string", "number", "boolean"]);
+const KNOWN_FIELD_TYPES = new Set<string>(FIELD_TYPES);
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -69,7 +69,7 @@ function readContract(value: unknown): DataContract | null {
   const fieldTypes: Record<string, FieldType> = {};
   if (isPlainObject(value["fieldTypes"])) {
     for (const [field, type] of Object.entries(value["fieldTypes"])) {
-      if (typeof type === "string" && FIELD_TYPES.has(type)) {
+      if (typeof type === "string" && KNOWN_FIELD_TYPES.has(type)) {
         fieldTypes[field] = type as FieldType;
       }
     }

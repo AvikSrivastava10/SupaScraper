@@ -115,6 +115,47 @@ describe("profileContract", () => {
     assert.deepEqual(contract.requiredFields, ["id"]);
   });
 
+  it("treats an always-empty list or object as absent, not as populated", () => {
+    // Observed live: a generated scraper returned `quotes: []` on every row. If
+    // that counts as populated, the contract claims a field is present and
+    // non-empty when it is empty every time, and the emptiness can never be
+    // detected again.
+    const contract = profileContract([
+      { url: "https://a.test/1", quotes: [], meta: {} },
+      { url: "https://a.test/2", quotes: [], meta: {} },
+    ]);
+    assert.deepEqual(contract.requiredFields, ["url"]);
+    assert.ok(!contract.requiredFields.includes("quotes"));
+    assert.ok(!contract.requiredFields.includes("meta"));
+  });
+
+  it("requires a list that actually carries values", () => {
+    const contract = profileContract([
+      { url: "https://a.test/1", tags: ["x"] },
+      { url: "https://a.test/2", tags: ["y", "z"] },
+    ]);
+    assert.ok(contract.requiredFields.includes("tags"));
+    assert.equal(contract.fieldTypes["tags"], "array");
+  });
+
+  it("types nested structures so a list cannot quietly become a string", () => {
+    const contract = profileContract([{ tags: ["x"], author: { name: "A" } }]);
+    assert.equal(contract.fieldTypes["tags"], "array");
+    assert.equal(contract.fieldTypes["author"], "object");
+
+    const broken = evaluateContract([{ tags: "x, y", author: { name: "A" } }], contract);
+    assert.equal(broken.valid, false);
+    assert.ok(broken.violations.some((violation) => violation.code === "tags_type_invalid"));
+  });
+
+  it("never picks a list or an object as the identity field", () => {
+    const contract = profileContract([
+      { tags: ["a"], label: "first" },
+      { tags: ["b"], label: "second" },
+    ]);
+    assert.equal(contract.identityField, "label");
+  });
+
   it("never profiles the vendor fields Bright Data adds", () => {
     const contract = profileContract([
       { ...VALID_RECORD, input: { url: "x" }, timestamp: "2026-01-01", warning: null },
@@ -187,6 +228,12 @@ describe("BOOTSTRAP_CONTRACT", () => {
 
   it("rejects a row whose values are all empty", () => {
     const result = evaluateContract([{ name: "", sku: null }], BOOTSTRAP_CONTRACT);
+    assert.equal(result.valid, false);
+    assert.ok(result.violations.some((violation) => violation.code === "record_has_no_data"));
+  });
+
+  it("rejects a row carrying only empty containers", () => {
+    const result = evaluateContract([{ quotes: [], meta: {} }], BOOTSTRAP_CONTRACT);
     assert.equal(result.valid, false);
     assert.ok(result.violations.some((violation) => violation.code === "record_has_no_data"));
   });

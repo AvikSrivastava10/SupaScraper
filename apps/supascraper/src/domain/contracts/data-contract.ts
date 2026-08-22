@@ -68,15 +68,26 @@ function typeOfValue(value: unknown): FieldType | null {
   if (typeof value === "string") return "string";
   if (typeof value === "number" && Number.isFinite(value)) return "number";
   if (typeof value === "boolean") return "boolean";
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "object" && value !== null) return "object";
   return null;
 }
 
+/**
+ * Whether a value carries no information.
+ *
+ * An empty list or an empty object counts. Observed live: a generated scraper
+ * returned `quotes: []` for every row, and treating that as populated made the
+ * profiler mark the field required, so a contract claimed a field was present
+ * and non-empty when it was empty every single time. A contract that describes
+ * absent data as present is worse than no contract.
+ */
 function isEmpty(value: unknown): boolean {
-  return (
-    value === null ||
-    value === undefined ||
-    (typeof value === "string" && value.trim().length === 0)
-  );
+  if (value === null || value === undefined) return true;
+  if (typeof value === "string") return value.trim().length === 0;
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === "object") return Object.keys(value).length === 0;
+  return false;
 }
 
 function dataFields(records: readonly ScrapedRecord[]): string[] {
@@ -102,10 +113,18 @@ export function chooseIdentityField(
   records: readonly ScrapedRecord[],
   fields: readonly string[],
 ): string | null {
+  // An identity has to be a single scalar. A list or a nested object may well be
+  // unique, but stringifying one into a key would be brittle and meaningless in
+  // a diff.
+  const isScalar = (value: unknown): boolean => {
+    const type = typeOfValue(value);
+    return type === "string" || type === "number" || type === "boolean";
+  };
+
   const isUsableIdentity = (field: string): boolean => {
     const values = records.map((record) => record[field]);
     if (values.some((value) => isEmpty(value))) return false;
-    if (values.some((value) => typeOfValue(value) === null)) return false;
+    if (values.some((value) => !isScalar(value))) return false;
     return new Set(values.map((value) => String(value))).size === records.length;
   };
 
@@ -264,7 +283,7 @@ export function evaluateContract(
         violations.push({
           code: `${field}_type_invalid`,
           path: `${path}.${field}`,
-          message: `${field} should be a ${expected} but was ${actual ?? "not a primitive"}.`,
+          message: `${field} should be a ${expected} but was ${actual ?? "an unsupported value"}.`,
         });
       }
     }

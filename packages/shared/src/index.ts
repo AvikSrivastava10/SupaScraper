@@ -5,6 +5,7 @@ export {
 export type { Availability, CatalogRecord } from "./catalog.js";
 
 export {
+  FIELD_TYPES,
   IDENTITY_HINTS,
   VENDOR_FIELDS,
   isVendorField,
