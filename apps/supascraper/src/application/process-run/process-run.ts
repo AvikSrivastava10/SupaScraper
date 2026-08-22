@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
 
-import type { CatalogRecord } from "@supascraper/shared";
+import type { ScrapedRecord } from "@supascraper/shared";
 
 import {
-  evaluateCatalogContract,
+  BOOTSTRAP_CONTRACT,
+  evaluateContract,
+  profileContract,
   type ContractEvaluation,
-} from "../../domain/contracts/catalog-contract.js";
+  type DataContract,
+} from "../../domain/contracts/data-contract.js";
 import type {
   CollectorConfig,
   NormalizedRunResult,
@@ -25,15 +28,18 @@ import type {
 } from "../heal-and-verify/heal-and-verify.js";
 import { healAndVerify } from "../heal-and-verify/heal-and-verify.js";
 
-export interface CatalogDataStore {
+export interface ScrapedDataStore {
   saveLastKnownGood(
     collectorId: string,
-    records: readonly CatalogRecord[],
+    records: readonly ScrapedRecord[],
     collectedAt: string,
   ): Promise<void>;
   getLastKnownGood(
     collectorId: string,
-  ): Promise<{ readonly records: readonly CatalogRecord[] } | null>;
+  ): Promise<{ readonly records: readonly ScrapedRecord[] } | null>;
+  /** Null until a run has been good enough to learn a contract from. */
+  getContract(collectorId: string): Promise<DataContract | null>;
+  saveContract(collectorId: string, contract: DataContract): Promise<void>;
 }
 
 export interface RepairEventStore {
@@ -46,6 +52,10 @@ export interface ProcessRunResult {
   readonly published: boolean;
   readonly repair: HealAndVerifyOutcome | null;
   readonly state: OrchestrationState;
+  /** The contract this run was judged against. */
+  readonly contract: DataContract;
+  /** True when this run taught the system what the site's data looks like. */
+  readonly contractLearned: boolean;
 }
 
 /**
@@ -108,16 +118,25 @@ function stateFor(
  */
 export async function processCollectorRun(
   run: NormalizedRunResult,
-  dataStore: CatalogDataStore,
+  dataStore: ScrapedDataStore,
   eventStore: RepairEventStore,
   options: ProcessRunOptions = {},
 ): Promise<ProcessRunResult> {
-  const evaluation = evaluateCatalogContract(run.records);
+  // A site the system has never scraped successfully has no contract yet, so it
+  // is judged against the universal minimum until a good run can teach it one.
+  const stored = await dataStore.getContract(run.collectorId);
+  const contract = stored ?? BOOTSTRAP_CONTRACT;
+  const evaluation = evaluateContract(run.records, contract);
 
   // The previously verified data is the only reference that can distinguish a
   // real data change from a partially broken extraction.
   const previous = await dataStore.getLastKnownGood(run.collectorId);
-  const deterministic = classifyRun(run, evaluation, previous?.records ?? null);
+  const deterministic = classifyRun(
+    run,
+    evaluation,
+    previous?.records ?? null,
+    contract,
+  );
 
   let decision = deterministic;
   if (options.reasoner !== undefined && shouldConsultReasoner(deterministic)) {
@@ -133,12 +152,22 @@ export async function processCollectorRun(
   const publishable =
     decision.recommendedAction === "publish" && evaluation.valid && run.records.length > 0;
 
+  let learnedContract: DataContract | null = null;
+
   if (publishable) {
     await dataStore.saveLastKnownGood(
       run.collectorId,
       evaluation.acceptedRecords,
       run.finishedAt,
     );
+
+    // First good run for this site: derive the contract that every later run
+    // will be held to. Learning it here, from data a human can see on the
+    // dashboard, is what allows an arbitrary site to be monitored at all.
+    if (stored === null) {
+      learnedContract = profileContract(evaluation.acceptedRecords);
+      await dataStore.saveContract(run.collectorId, learnedContract);
+    }
   }
 
   let repair: HealAndVerifyOutcome | null = null;
@@ -164,6 +193,7 @@ export async function processCollectorRun(
         config: options.config,
         decision,
         healPrompt,
+        contract,
         ...(previous === null ? {} : { baseline: previous.records }),
       },
       options.repair,
@@ -183,7 +213,7 @@ export async function processCollectorRun(
   const afterMetrics =
     repair?.verificationRun === null || repair?.verificationRun === undefined
       ? null
-      : evaluateCatalogContract(repair.verificationRun.records).metrics;
+      : evaluateContract(repair.verificationRun.records, contract).metrics;
 
   const now = new Date().toISOString();
   await eventStore.appendEvent({
@@ -203,5 +233,13 @@ export async function processCollectorRun(
     updatedAt: now,
   });
 
-  return { decision, evaluation, published, repair, state };
+  return {
+    decision,
+    evaluation,
+    published,
+    repair,
+    state,
+    contract: learnedContract ?? contract,
+    contractLearned: learnedContract !== null,
+  };
 }

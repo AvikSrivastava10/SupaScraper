@@ -1,14 +1,18 @@
-import type { CatalogRecord } from "@supascraper/shared";
+import type { ScrapedRecord } from "@supascraper/shared";
 
-import { evaluateCatalogContract } from "../../domain/contracts/catalog-contract.js";
+import {
+  evaluateContract,
+  type DataContract,
+} from "../../domain/contracts/data-contract.js";
 import type {
   CollectorConfig,
   NormalizedRunResult,
 } from "../../domain/contracts/collector-run.js";
+import { rowFingerprint } from "../../domain/detection/compare-baseline.js";
 import type { DetectionDecision } from "../../domain/detection/classify-run.js";
 import type { OrchestrationState } from "../../domain/state-machine/state-machine.js";
 import { transitionState } from "../../domain/state-machine/state-machine.js";
-import type { CatalogDataStore } from "../process-run/process-run.js";
+import type { ScrapedDataStore } from "../process-run/process-run.js";
 import type { CollectorRunner } from "../run-collector/run-collector.js";
 
 /**
@@ -44,7 +48,7 @@ export interface PreviewReview {
  * contract the collector is expected to produce.
  */
 export interface HealPreviewReviewer {
-  review(envelope: HealEnvelope, config: CollectorConfig): PreviewReview;
+  review(envelope: HealEnvelope, contract: DataContract): PreviewReview;
 }
 
 export interface CollectorLock {
@@ -56,31 +60,48 @@ export interface HealAndVerifyInput {
   readonly config: CollectorConfig;
   readonly decision: DetectionDecision;
   readonly healPrompt: string;
+  /** The contract the repaired collector has to satisfy again. */
+  readonly contract: DataContract;
   /**
    * Last verified data, used to confirm the repaired scraper still returns the
-   * same products rather than merely returning something contract-shaped.
+   * same rows rather than merely returning something contract-shaped.
    */
-  readonly baseline?: readonly CatalogRecord[];
+  readonly baseline?: readonly ScrapedRecord[];
 }
 
 /**
- * Fraction of baseline products a repaired run must still return.
+ * Fraction of baseline rows a repaired run must still return.
  *
  * A heal that latched onto the wrong element can satisfy the contract while
- * losing most of the catalog, so contract validity alone is not enough to call
- * a repair successful.
+ * losing most of the data, so contract validity alone is not enough to call a
+ * repair successful.
  */
 export const MIN_BASELINE_OVERLAP = 0.5;
 
+/**
+ * How much of the previously known data survived a repair.
+ *
+ * Rows are matched on the contract's identity field when there is one. Without
+ * one the whole row is the key, which is stricter: a legitimate value change
+ * then counts as a miss. That errs toward manual review rather than toward
+ * publishing a repair that quietly replaced the data.
+ */
 export function baselineOverlap(
-  baseline: readonly CatalogRecord[],
-  recovered: readonly CatalogRecord[],
+  baseline: readonly ScrapedRecord[],
+  recovered: readonly ScrapedRecord[],
+  contract: DataContract,
 ): number {
   if (baseline.length === 0) {
     return 1;
   }
-  const recoveredSkus = new Set(recovered.map((record) => record.sku));
-  const retained = baseline.filter((record) => recoveredSkus.has(record.sku)).length;
+
+  const keyOf = (record: ScrapedRecord): string =>
+    contract.identityField === null
+      ? rowFingerprint(record)
+      : String(record[contract.identityField] ?? "");
+
+  const recoveredKeys = new Set(recovered.map((record) => keyOf(record)));
+  const retained = baseline.filter((record) => recoveredKeys.has(keyOf(record))).length;
   return retained / baseline.length;
 }
 
@@ -103,7 +124,7 @@ export interface HealAndVerifyDependencies {
   readonly approver: CollectorApprover;
   readonly reviewer: HealPreviewReviewer;
   readonly runner: CollectorRunner;
-  readonly dataStore: CatalogDataStore;
+  readonly dataStore: ScrapedDataStore;
   readonly lock: CollectorLock;
 }
 
@@ -172,7 +193,7 @@ export async function healAndVerify(
 
     state = transitionState(state, "awaiting_approval");
 
-    const review = reviewer.review(envelope, input.config);
+    const review = reviewer.review(envelope, input.contract);
     if (!review.plausible) {
       await approver.reject(input.config.collectorId);
       return {
@@ -190,7 +211,7 @@ export async function healAndVerify(
 
     // Approval commits the change. Recovery still has to be earned by a run.
     const verificationRun = await runner.run(input.config);
-    const evaluation = evaluateCatalogContract(verificationRun.records);
+    const evaluation = evaluateContract(verificationRun.records, input.contract);
     const sameCollector =
       verificationRun.collectorId === input.config.collectorId &&
       verificationRun.targetUrl === input.config.targetUrl;
@@ -220,9 +241,13 @@ export async function healAndVerify(
     }
 
     // Contract-shaped is not the same as correct. Confirm the repaired scraper
-    // still returns the products it used to.
+    // still returns the rows it used to.
     if (input.baseline !== undefined && input.baseline.length > 0) {
-      const overlap = baselineOverlap(input.baseline, evaluation.acceptedRecords);
+      const overlap = baselineOverlap(
+        input.baseline,
+        evaluation.acceptedRecords,
+        input.contract,
+      );
       if (overlap < MIN_BASELINE_OVERLAP) {
         return {
           status: "manual_review",
@@ -230,7 +255,7 @@ export async function healAndVerify(
           envelope,
           review,
           verificationRun,
-          reason: `Repaired output retained only ${String(Math.round(overlap * 100))}% of previously known products, so it may be extracting the wrong element.`,
+          reason: `Repaired output retained only ${String(Math.round(overlap * 100))}% of previously known rows, so it may be extracting the wrong element.`,
         };
       }
     }
@@ -261,10 +286,10 @@ export async function healAndVerify(
 
 /**
  * Deterministic preview review: the preview must be a record array that
- * satisfies the catalog contract. Used before any LLM opinion is consulted.
+ * satisfies the target's own contract. Used before any LLM opinion is consulted.
  */
 export class ContractPreviewReviewer implements HealPreviewReviewer {
-  review(envelope: HealEnvelope): PreviewReview {
+  review(envelope: HealEnvelope, contract: DataContract): PreviewReview {
     const preview = envelope.previewResult;
 
     if (!Array.isArray(preview)) {
@@ -274,7 +299,7 @@ export class ContractPreviewReviewer implements HealPreviewReviewer {
       };
     }
 
-    const evaluation = evaluateCatalogContract(preview);
+    const evaluation = evaluateContract(preview, contract);
     if (!evaluation.valid) {
       return {
         plausible: false,
@@ -285,7 +310,7 @@ export class ContractPreviewReviewer implements HealPreviewReviewer {
     return {
       plausible: true,
       evidence: [
-        `Preview satisfies the catalog contract across ${String(evaluation.metrics.validRowCount)} record(s).`,
+        `Preview satisfies the expected contract across ${String(evaluation.metrics.validRowCount)} record(s).`,
       ],
     };
   }

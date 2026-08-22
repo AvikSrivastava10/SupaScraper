@@ -2,38 +2,100 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import type { CatalogRecord } from "@supascraper/shared";
+import type { FieldType, ScrapedRecord } from "@supascraper/shared";
 
 import type { CollectorLock } from "../../application/heal-and-verify/heal-and-verify.js";
 import type {
-  CatalogDataStore,
   RepairEventStore,
+  ScrapedDataStore,
 } from "../../application/process-run/process-run.js";
+import type { DataContract } from "../../domain/contracts/data-contract.js";
 import type { RepairEvent } from "../../domain/repair/repair-event.js";
 import type {
   DashboardDataReader,
-  StoredCatalogSnapshot,
+  StoredSnapshot,
 } from "./in-memory-repository.js";
 
 interface PersistedState {
-  readonly version: 1;
-  readonly catalog: Record<string, StoredCatalogSnapshot>;
+  readonly version: 2;
+  readonly snapshots: Record<string, StoredSnapshot>;
+  readonly contracts: Record<string, DataContract>;
   readonly events: RepairEvent[];
 }
 
 const MAX_EVENTS = 200;
 
-const EMPTY: PersistedState = { version: 1, catalog: {}, events: [] };
+const EMPTY: PersistedState = {
+  version: 2,
+  snapshots: {},
+  contracts: {},
+  events: [],
+};
+
+const FIELD_TYPES = new Set<string>(["string", "number", "boolean"]);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
+    : [];
+}
 
 /**
- * File-backed store so verified data and repair history survive a restart.
+ * Rebuilds a contract from the file, or discards it.
+ *
+ * A malformed contract is worse than a missing one: it would silently hold every
+ * future run to rules nobody chose. Dropping it means the next good run simply
+ * profiles a fresh one.
+ */
+function readContract(value: unknown): DataContract | null {
+  if (!isPlainObject(value)) return null;
+
+  const version = value["version"];
+  const minimumRows = value["minimumRows"];
+  const maximumRows = value["maximumRows"];
+  const profiledAt = value["profiledAt"];
+  const identityField = value["identityField"];
+
+  if (typeof version !== "number" || !Number.isFinite(version)) return null;
+  if (typeof minimumRows !== "number" || !Number.isInteger(minimumRows)) return null;
+  if (typeof maximumRows !== "number" || !Number.isInteger(maximumRows)) return null;
+  if (typeof profiledAt !== "string") return null;
+  if (identityField !== null && typeof identityField !== "string") return null;
+
+  const fieldTypes: Record<string, FieldType> = {};
+  if (isPlainObject(value["fieldTypes"])) {
+    for (const [field, type] of Object.entries(value["fieldTypes"])) {
+      if (typeof type === "string" && FIELD_TYPES.has(type)) {
+        fieldTypes[field] = type as FieldType;
+      }
+    }
+  }
+
+  return {
+    version,
+    requiredFields: readStringArray(value["requiredFields"]),
+    fieldTypes,
+    identityField,
+    minimumRows,
+    maximumRows,
+    profiledAt,
+  };
+}
+
+/**
+ * File-backed store so verified data, learned contracts, and repair history
+ * survive a restart.
  *
  * Locks are intentionally kept in memory: a lock represents an operation held
  * by this process, and persisting one would risk a stale lock outliving the
  * process that owned it and blocking every future repair.
  */
 export class JsonFileRepository
-  implements CatalogDataStore, RepairEventStore, CollectorLock, DashboardDataReader
+  implements ScrapedDataStore, RepairEventStore, CollectorLock, DashboardDataReader
 {
   readonly #filePath: string;
   readonly #locks = new Map<string, string>();
@@ -45,7 +107,7 @@ export class JsonFileRepository
   }
 
   /**
-   * Validates each snapshot rather than trusting the file.
+   * Validates each entry rather than trusting the file.
    *
    * A file that is valid JSON but the wrong shape would otherwise pass straight
    * through and throw later while rendering, turning bad state into a crash far
@@ -53,40 +115,50 @@ export class JsonFileRepository
    */
   #read(): PersistedState {
     try {
-      const parsed = JSON.parse(readFileSync(this.#filePath, "utf8")) as unknown;
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      const parsed: unknown = JSON.parse(readFileSync(this.#filePath, "utf8"));
+      if (!isPlainObject(parsed)) {
         return { ...EMPTY };
       }
 
-      const candidate = parsed as Record<string, unknown>;
-      const rawCatalog = candidate["catalog"];
-      const catalog: Record<string, StoredCatalogSnapshot> = {};
+      // Version 1 stored rows under "catalog". Reading both keys keeps data
+      // collected before contracts existed.
+      const rawSnapshots = parsed["snapshots"] ?? parsed["catalog"];
+      const snapshots: Record<string, StoredSnapshot> = {};
 
-      if (typeof rawCatalog === "object" && rawCatalog !== null && !Array.isArray(rawCatalog)) {
-        for (const [key, value] of Object.entries(rawCatalog as Record<string, unknown>)) {
-          if (typeof value !== "object" || value === null) continue;
-          const snapshot = value as Record<string, unknown>;
-          if (!Array.isArray(snapshot["records"])) continue;
-          if (typeof snapshot["collectedAt"] !== "string") continue;
-          catalog[key] = {
+      if (isPlainObject(rawSnapshots)) {
+        for (const [key, value] of Object.entries(rawSnapshots)) {
+          if (!isPlainObject(value)) continue;
+          if (!Array.isArray(value["records"])) continue;
+          if (typeof value["collectedAt"] !== "string") continue;
+          snapshots[key] = {
             collectorId: key,
-            records: snapshot["records"] as StoredCatalogSnapshot["records"],
-            collectedAt: snapshot["collectedAt"],
+            records: value["records"].filter((record): record is ScrapedRecord =>
+              isPlainObject(record),
+            ),
+            collectedAt: value["collectedAt"],
           };
         }
       }
 
-      const rawEvents = candidate["events"];
+      const contracts: Record<string, DataContract> = {};
+      if (isPlainObject(parsed["contracts"])) {
+        for (const [key, value] of Object.entries(parsed["contracts"])) {
+          const contract = readContract(value);
+          if (contract !== null) {
+            contracts[key] = contract;
+          }
+        }
+      }
+
+      const rawEvents = parsed["events"];
       const events = Array.isArray(rawEvents)
         ? rawEvents.filter(
             (event): event is RepairEvent =>
-              typeof event === "object" &&
-              event !== null &&
-              typeof (event as Record<string, unknown>)["collectorId"] === "string",
+              isPlainObject(event) && typeof event["collectorId"] === "string",
           )
         : [];
 
-      return { version: 1, catalog, events };
+      return { version: 2, snapshots, contracts, events };
     } catch {
       // Missing or corrupt state must not prevent the app from starting.
       return { ...EMPTY };
@@ -102,13 +174,13 @@ export class JsonFileRepository
 
   saveLastKnownGood(
     collectorId: string,
-    records: readonly CatalogRecord[],
+    records: readonly ScrapedRecord[],
     collectedAt: string,
   ): Promise<void> {
     this.#state = {
       ...this.#state,
-      catalog: {
-        ...this.#state.catalog,
+      snapshots: {
+        ...this.#state.snapshots,
         [collectorId]: {
           collectorId,
           records: records.map((record) => ({ ...record })),
@@ -120,8 +192,8 @@ export class JsonFileRepository
     return Promise.resolve();
   }
 
-  getLastKnownGood(collectorId: string): Promise<StoredCatalogSnapshot | null> {
-    const snapshot = this.#state.catalog[collectorId];
+  getLastKnownGood(collectorId: string): Promise<StoredSnapshot | null> {
+    const snapshot = this.#state.snapshots[collectorId];
     if (!snapshot) {
       return Promise.resolve(null);
     }
@@ -129,6 +201,19 @@ export class JsonFileRepository
       ...snapshot,
       records: snapshot.records.map((record) => ({ ...record })),
     });
+  }
+
+  getContract(collectorId: string): Promise<DataContract | null> {
+    return Promise.resolve(this.#state.contracts[collectorId] ?? null);
+  }
+
+  saveContract(collectorId: string, contract: DataContract): Promise<void> {
+    this.#state = {
+      ...this.#state,
+      contracts: { ...this.#state.contracts, [collectorId]: contract },
+    };
+    this.#write();
+    return Promise.resolve();
   }
 
   appendEvent(event: RepairEvent): Promise<void> {
