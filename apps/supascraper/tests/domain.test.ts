@@ -3,9 +3,12 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
-  DEFAULT_CATALOG_CONTRACT,
-  evaluateCatalogContract,
-} from "../dist/domain/contracts/catalog-contract.js";
+  BOOTSTRAP_CONTRACT,
+  evaluateContract,
+  isProfiled,
+  profileContract,
+  tableColumns,
+} from "../dist/domain/contracts/data-contract.js";
 import type { NormalizedRunResult } from "../dist/domain/contracts/collector-run.js";
 import { classifyRun } from "../dist/domain/detection/classify-run.js";
 import {
@@ -29,6 +32,26 @@ const VALID_RECORD = {
   availability: "in_stock",
 };
 
+const SECOND_RECORD = {
+  name: "Linear Rail 300mm",
+  sku: "RAIL-300",
+  price: 18.4,
+  availability: "low_stock",
+};
+
+/**
+ * The contract a real catalog run would have produced.
+ *
+ * Building it with the profiler rather than by hand is deliberate: every
+ * assertion below then exercises the same path a brand new website takes.
+ */
+const CATALOG = profileContract([VALID_RECORD, SECOND_RECORD]);
+
+const evaluate = (records: readonly unknown[]) => evaluateContract(records, CATALOG);
+
+const codes = (records: readonly unknown[]): string[] =>
+  evaluate(records).violations.map((violation) => violation.code);
+
 const succeeded = (
   records: readonly unknown[],
   extractionErrors: NormalizedRunResult["extractionErrors"] = [],
@@ -44,9 +67,134 @@ const succeeded = (
   safeError: null,
 });
 
-describe("evaluateCatalogContract", () => {
+describe("profileContract", () => {
+  it("learns the fields, types, and identity from a good run", () => {
+    assert.deepEqual([...CATALOG.requiredFields].sort(), [
+      "availability",
+      "name",
+      "price",
+      "sku",
+    ]);
+    assert.equal(CATALOG.fieldTypes["price"], "number");
+    assert.equal(CATALOG.fieldTypes["name"], "string");
+    assert.equal(CATALOG.identityField, "sku");
+    assert.equal(isProfiled(CATALOG), true);
+  });
+
+  it("works on a shape it has never seen before", () => {
+    const contract = profileContract([
+      { title: "Dune", author: "Herbert", isbn: "9780441013593", pages: 412 },
+      { title: "Neuromancer", author: "Gibson", isbn: "9780441569595", pages: 271 },
+    ]);
+    assert.deepEqual([...contract.requiredFields].sort(), [
+      "author",
+      "isbn",
+      "pages",
+      "title",
+    ]);
+    assert.equal(contract.fieldTypes["pages"], "number");
+    assert.equal(contract.identityField, "isbn");
+  });
+
+  it("treats a field missing from some rows as optional, not required", () => {
+    const contract = profileContract([
+      { id: "1", name: "a", discount: "10%" },
+      { id: "2", name: "b" },
+    ]);
+    assert.deepEqual([...contract.requiredFields].sort(), ["id", "name"]);
+    assert.ok(!contract.requiredFields.includes("discount"));
+    // The optional field is still typed, so a later type change is detectable.
+    assert.equal(contract.fieldTypes["discount"], "string");
+  });
+
+  it("treats an empty value as absent when deciding what is required", () => {
+    const contract = profileContract([
+      { id: "1", note: "hello" },
+      { id: "2", note: "   " },
+    ]);
+    assert.deepEqual(contract.requiredFields, ["id"]);
+  });
+
+  it("never profiles the vendor fields Bright Data adds", () => {
+    const contract = profileContract([
+      { ...VALID_RECORD, input: { url: "x" }, timestamp: "2026-01-01", warning: null },
+    ]);
+    assert.ok(!contract.requiredFields.includes("input"));
+    assert.ok(!contract.requiredFields.includes("timestamp"));
+    assert.ok(!contract.requiredFields.includes("warning"));
+  });
+
+  it("prefers a conventional identifier over an incidental unique field", () => {
+    const contract = profileContract([
+      { name: "only-unique-by-accident", sku: "A1" },
+      { name: "another", sku: "A2" },
+    ]);
+    assert.equal(contract.identityField, "sku");
+  });
+
+  it("falls back to any unique field when no conventional name exists", () => {
+    const contract = profileContract([
+      { title: "First", body: "same" },
+      { title: "Second", body: "same" },
+    ]);
+    assert.equal(contract.identityField, "title");
+  });
+
+  it("reports no identity when nothing is unique", () => {
+    const contract = profileContract([
+      { tag: "a", group: "x" },
+      { tag: "a", group: "x" },
+    ]);
+    assert.equal(contract.identityField, null);
+  });
+
+  it("allows room for the data to grow", () => {
+    const contract = profileContract([VALID_RECORD, SECOND_RECORD]);
+    assert.ok(contract.maximumRows >= 50);
+    assert.equal(contract.minimumRows, 1);
+  });
+});
+
+describe("BOOTSTRAP_CONTRACT", () => {
+  it("is not mistaken for a learned contract", () => {
+    assert.equal(isProfiled(BOOTSTRAP_CONTRACT), false);
+  });
+
+  it("accepts any shape of real data, so a new site can be profiled", () => {
+    const result = evaluateContract(
+      [{ anything: "at all" }, { totally: "different", shape: 2 }],
+      BOOTSTRAP_CONTRACT,
+    );
+    assert.equal(result.valid, true);
+    assert.equal(result.acceptedRecords.length, 2);
+  });
+
+  it("still rejects a run that returned nothing", () => {
+    const result = evaluateContract([], BOOTSTRAP_CONTRACT);
+    assert.equal(result.valid, false);
+    assert.ok(result.violations.some((violation) => violation.code === "row_count_too_low"));
+  });
+
+  it("still rejects rows that carry no data", () => {
+    const result = evaluateContract(
+      [{ input: { url: "x" }, timestamp: "2026-01-01" }],
+      BOOTSTRAP_CONTRACT,
+    );
+    assert.equal(result.valid, false);
+    assert.ok(result.violations.some((violation) => violation.code === "record_has_no_data"));
+    assert.equal(result.acceptedRecords.length, 0);
+  });
+
+  it("rejects a row whose values are all empty", () => {
+    const result = evaluateContract([{ name: "", sku: null }], BOOTSTRAP_CONTRACT);
+    assert.equal(result.valid, false);
+    assert.ok(result.violations.some((violation) => violation.code === "record_has_no_data"));
+  });
+});
+
+describe("evaluateContract", () => {
   it("accepts a valid dataset and counts it correctly", () => {
-    const result = evaluateCatalogContract([VALID_RECORD]);
+    const result = evaluate([VALID_RECORD]);
     assert.equal(result.valid, true);
     assert.equal(result.violations.length, 0);
     assert.equal(result.metrics.rowCount, 1);
@@ -54,91 +202,114 @@ describe("evaluateCatalogContract", () => {
   });
 
   it("tolerates extra vendor fields that Bright Data adds", () => {
-    const result = evaluateCatalogContract([
+    const result = evaluate([
       { ...VALID_RECORD, product_page_url: "https://example.test/p/1", input: { url: "x" } },
     ]);
     assert.equal(result.valid, true);
   });
 
   it("rejects an empty dataset", () => {
-    const result = evaluateCatalogContract([]);
-    assert.equal(result.valid, false);
-    assert.ok(result.violations.some((violation) => violation.code === "row_count_out_of_range"));
+    assert.ok(codes([]).includes("row_count_too_low"));
   });
 
   it("rejects a row count above the maximum", () => {
-    const many = Array.from({ length: DEFAULT_CATALOG_CONTRACT.maximumRows + 1 }, () => VALID_RECORD);
-    assert.equal(evaluateCatalogContract(many).valid, false);
+    const many = Array.from({ length: CATALOG.maximumRows + 1 }, (_unused, index) => ({
+      ...VALID_RECORD,
+      sku: `MTR-${String(index)}`,
+    }));
+    assert.ok(codes(many).includes("row_count_too_high"));
   });
 
   it("reports the specific missing field", () => {
     const { price: _price, ...withoutPrice } = VALID_RECORD;
-    const result = evaluateCatalogContract([withoutPrice]);
+    const result = evaluate([withoutPrice]);
     assert.equal(result.valid, false);
-    assert.ok(result.violations.some((violation) => violation.code === "price_invalid"));
-    assert.equal(result.metrics.missingByField.price, 1);
-    assert.equal(result.metrics.missingByField.name, 0);
+    assert.ok(result.violations.some((violation) => violation.code === "price_missing"));
+    assert.equal(result.metrics.missingByField["price"], 1);
+    assert.equal(result.metrics.missingByField["name"], 0);
   });
 
-  it("distinguishes a null field from a missing field", () => {
-    const result = evaluateCatalogContract([{ ...VALID_RECORD, price: null }]);
-    assert.equal(result.metrics.nullByField.price, 1);
-    assert.equal(result.metrics.missingByField.price, 0);
+  it("distinguishes an empty field from a missing field", () => {
+    const result = evaluate([{ ...VALID_RECORD, price: null }]);
+    assert.equal(result.metrics.nullByField["price"], 1);
+    assert.equal(result.metrics.missingByField["price"], 0);
   });
 
-  it("rejects wrong primitive types", () => {
-    assert.equal(evaluateCatalogContract([{ ...VALID_RECORD, price: "49.95" }]).valid, false);
-    assert.equal(evaluateCatalogContract([{ ...VALID_RECORD, name: 42 }]).valid, false);
-    assert.equal(evaluateCatalogContract([{ ...VALID_RECORD, sku: null }]).valid, false);
+  it("rejects a value whose type no longer matches what was learned", () => {
+    assert.ok(codes([{ ...VALID_RECORD, price: "49.95" }]).includes("price_type_invalid"));
+    assert.ok(codes([{ ...VALID_RECORD, name: 42 }]).includes("name_type_invalid"));
   });
 
-  it("rejects an empty or whitespace-only string", () => {
-    assert.equal(evaluateCatalogContract([{ ...VALID_RECORD, name: "   " }]).valid, false);
-    assert.equal(evaluateCatalogContract([{ ...VALID_RECORD, sku: "" }]).valid, false);
+  it("rejects an empty, whitespace-only, or null value", () => {
+    assert.ok(codes([{ ...VALID_RECORD, name: "   " }]).includes("name_empty"));
+    assert.ok(codes([{ ...VALID_RECORD, sku: "" }]).includes("sku_empty"));
+    assert.ok(codes([{ ...VALID_RECORD, sku: null }]).includes("sku_empty"));
   });
 
-  it("enforces the price domain rule", () => {
-    assert.equal(evaluateCatalogContract([{ ...VALID_RECORD, price: -0.01 }]).valid, false);
-    assert.equal(evaluateCatalogContract([{ ...VALID_RECORD, price: 0 }]).valid, true);
-    assert.equal(evaluateCatalogContract([{ ...VALID_RECORD, price: Number.NaN }]).valid, false);
-    assert.equal(
-      evaluateCatalogContract([{ ...VALID_RECORD, price: Number.POSITIVE_INFINITY }]).valid,
-      false,
+  it("refuses a number that is not finite", () => {
+    assert.ok(codes([{ ...VALID_RECORD, price: Number.NaN }]).includes("price_type_invalid"));
+    assert.ok(
+      codes([{ ...VALID_RECORD, price: Number.POSITIVE_INFINITY }]).includes(
+        "price_type_invalid",
+      ),
     );
   });
 
-  it("enforces the availability enumeration", () => {
-    assert.equal(evaluateCatalogContract([{ ...VALID_RECORD, availability: "maybe" }]).valid, false);
-    for (const availability of ["in_stock", "low_stock", "out_of_stock"]) {
-      assert.equal(evaluateCatalogContract([{ ...VALID_RECORD, availability }]).valid, true);
-    }
+  it("does not invent value rules it could not have learned", () => {
+    // A negative number is not a contract violation. Nothing in a scraped page
+    // tells us a field is a price, so inventing a domain rule would reject
+    // legitimate data on other sites.
+    assert.equal(evaluate([{ ...VALID_RECORD, price: -0.01 }]).valid, true);
+  });
+
+  it("rejects a duplicated identity, because it means one row was matched twice", () => {
+    const result = evaluate([VALID_RECORD, { ...VALID_RECORD, name: "Different name" }]);
+    assert.equal(result.valid, false);
+    assert.ok(result.violations.some((violation) => violation.code === "identity_duplicated"));
+    assert.equal(result.acceptedRecords.length, 1);
   });
 
   it("rejects non-object rows without throwing", () => {
     for (const row of [null, "string", 42, [], undefined]) {
-      const result = evaluateCatalogContract([row]);
+      const result = evaluate([row]);
       assert.equal(result.valid, false);
       assert.ok(result.violations.some((violation) => violation.code === "record_type_invalid"));
     }
   });
 
   it("only accepts fully valid rows into acceptedRecords", () => {
-    const result = evaluateCatalogContract([VALID_RECORD, { ...VALID_RECORD, price: -1 }]);
+    const { price: _price, ...broken } = SECOND_RECORD;
+    const result = evaluate([VALID_RECORD, broken]);
     assert.equal(result.valid, false);
     assert.equal(result.acceptedRecords.length, 1);
   });
 });
 
+describe("tableColumns", () => {
+  it("puts the identity first when a contract has been learned", () => {
+    assert.equal(tableColumns(CATALOG, [VALID_RECORD])[0], "sku");
+  });
+
+  it("falls back to the data itself before any contract exists", () => {
+    const columns = tableColumns(null, [{ alpha: 1, beta: 2, input: {} }]);
+    assert.deepEqual(columns, ["alpha", "beta"]);
+  });
+
+  it("returns nothing to render when there is neither contract nor data", () => {
+    assert.deepEqual(tableColumns(null, []), []);
+  });
+});
+
 describe("classifyRun", () => {
   it("classifies a valid run as healthy and publishable", () => {
-    const decision = classifyRun(succeeded([VALID_RECORD]), evaluateCatalogContract([VALID_RECORD]));
+    const decision = classifyRun(succeeded([VALID_RECORD]), evaluate([VALID_RECORD]));
     assert.equal(decision.classification, "healthy");
     assert.equal(decision.recommendedAction, "publish");
   });
 
   it("classifies a successful run with broken output as a structural break", () => {
     const records = [{ ...VALID_RECORD, price: undefined }];
-    const decision = classifyRun(succeeded(records), evaluateCatalogContract(records));
+    const decision = classifyRun(succeeded(records), evaluate(records));
     assert.equal(decision.classification, "structural_break");
     assert.equal(decision.recommendedAction, "heal");
     assert.ok(decision.evidence.length > 0);
@@ -151,7 +322,7 @@ describe("classifyRun", () => {
       records: [],
       safeError: { category: "network", message: "connection reset", retryable: true },
     };
-    const decision = classifyRun(run, evaluateCatalogContract([]));
+    const decision = classifyRun(run, evaluate([]));
     assert.equal(decision.classification, "transient_error");
     assert.equal(decision.recommendedAction, "retry");
   });
@@ -163,7 +334,7 @@ describe("classifyRun", () => {
       records: [],
       safeError: { category: "timeout", message: "deadline exceeded", retryable: true },
     };
-    assert.equal(classifyRun(run, evaluateCatalogContract([])).classification, "transient_error");
+    assert.equal(classifyRun(run, evaluate([])).classification, "transient_error");
   });
 
   it("routes a non-retryable failure to manual review rather than healing", () => {
@@ -173,17 +344,29 @@ describe("classifyRun", () => {
       records: [],
       safeError: { category: "auth", message: "forbidden", retryable: false },
     };
-    const decision = classifyRun(run, evaluateCatalogContract([]));
+    const decision = classifyRun(run, evaluate([]));
     assert.equal(decision.classification, "ambiguous");
     assert.equal(decision.recommendedAction, "manual_review");
   });
 
   it("keeps confidence within range and is deterministic", () => {
     const records = [VALID_RECORD];
-    const first = classifyRun(succeeded(records), evaluateCatalogContract(records));
-    const second = classifyRun(succeeded(records), evaluateCatalogContract(records));
+    const first = classifyRun(succeeded(records), evaluate(records));
+    const second = classifyRun(succeeded(records), evaluate(records));
     assert.deepEqual(first, second);
     assert.ok(first.confidence >= 0 && first.confidence <= 1);
+  });
+
+  it("holds an unprofiled site to the bootstrap contract only", () => {
+    const rows = [{ headline: "Something happened", url: "https://news.test/1" }];
+    const decision = classifyRun(
+      succeeded(rows),
+      evaluateContract(rows, BOOTSTRAP_CONTRACT),
+      null,
+      BOOTSTRAP_CONTRACT,
+    );
+    assert.equal(decision.classification, "healthy");
+    assert.equal(decision.recommendedAction, "publish");
   });
 });
 
@@ -221,6 +404,12 @@ describe("loadConfig", () => {
     assert.equal(config.collector, null);
     assert.equal(config.port, 3000);
     assert.equal(config.geminiEnabled, false);
+  });
+
+  it("supplies a place to persist sites added at runtime", () => {
+    const config = loadConfig({});
+    assert.match(config.addedTargetsPath, /targets\.json$/);
+    assert.ok(config.defaultRunTimeoutMs > 0);
   });
 
   it("requires collector id and url together", () => {
@@ -263,6 +452,11 @@ describe("loadConfig", () => {
     assert.throws(() => loadConfig({ SUPASCRAPER_PORT: "70000" }), /65535/);
     assert.throws(() => loadConfig({ SUPASCRAPER_GEMINI_ENABLED: "yes" }), /true or false/);
   });
+
+  it("treats loopback hosts as unexposed", () => {
+    assert.equal(isLoopbackHost("127.0.0.1"), true);
+    assert.equal(isLoopbackHost("0.0.0.0"), false);
+  });
 });
 
 describe("InMemoryRepository", () => {
@@ -273,11 +467,19 @@ describe("InMemoryRepository", () => {
 
     records[0].price = 999;
     const snapshot = await repository.getLastKnownGood("c_x");
-    assert.equal(snapshot?.records[0]?.price, 49.95);
+    assert.equal(snapshot?.records[0]?.["price"], 49.95);
 
     (snapshot?.records as { price: number }[])[0].price = 1;
     const again = await repository.getLastKnownGood("c_x");
-    assert.equal(again?.records[0]?.price, 49.95);
+    assert.equal(again?.records[0]?.["price"], 49.95);
+  });
+
+  it("remembers a learned contract per collector", async () => {
+    const repository = new InMemoryRepository();
+    assert.equal(await repository.getContract("c_x"), null);
+    await repository.saveContract("c_x", CATALOG);
+    assert.equal((await repository.getContract("c_x"))?.identityField, "sku");
+    assert.equal(await repository.getContract("c_other"), null);
   });
 
   it("grants a lock once and refuses a concurrent acquisition", async () => {
@@ -308,8 +510,8 @@ describe("InMemoryRepository", () => {
       beforeMetrics: {
         rowCount: 1,
         validRowCount: 1,
-        missingByField: { name: 0, sku: 0, price: 0, availability: 0 },
-        nullByField: { name: 0, sku: 0, price: 0, availability: 0 },
+        missingByField: {},
+        nullByField: {},
       },
       afterMetrics: null,
       healPrompt: null,
@@ -332,6 +534,7 @@ describe("UnconfiguredBrightDataAdapter", () => {
       ["heal", adapter.heal("c_x", "prompt")],
       ["approve", adapter.approve("c_x")],
       ["reject", adapter.reject("c_x")],
+      ["create", adapter.create({ url: "https://e.test", description: "d", name: "n" })],
     ];
     for (const [name, promise] of operations) {
       await assert.rejects(promise, BrightDataIntegrationNotConfiguredError, name);
@@ -356,12 +559,27 @@ describe("committed Bright Data fixtures", () => {
   const load = (name: string): unknown[] =>
     JSON.parse(readFileSync(new URL(`../../../fixtures/samples/${name}`, import.meta.url), "utf8"));
 
+  /** Learned from the recorded good run, exactly as the running system would. */
+  const fixtureContract = profileContract(
+    parseRunOutput(
+      readFileSync(
+        new URL("../../../fixtures/samples/collector-baseline.json", import.meta.url),
+        "utf8",
+      ),
+    ).records as Record<string, unknown>[],
+  );
+
+  it("learns a usable contract from the recorded good run", () => {
+    assert.ok(fixtureContract.requiredFields.includes("sku"));
+    assert.equal(fixtureContract.identityField, "sku");
+  });
+
   it("the recorded baseline satisfies the contract", () => {
-    assert.equal(evaluateCatalogContract(load("collector-baseline.json")).valid, true);
+    assert.equal(evaluateContract(load("collector-baseline.json"), fixtureContract).valid, true);
   });
 
   it("the recorded structural break violates the contract", () => {
-    const result = evaluateCatalogContract(load("collector-structural-break.json"));
+    const result = evaluateContract(load("collector-structural-break.json"), fixtureContract);
     assert.equal(result.valid, false);
     assert.equal(result.metrics.validRowCount, 0);
   });
@@ -376,7 +594,7 @@ describe("committed Bright Data fixtures", () => {
         .sort((a, b) => String(a.sku).localeCompare(String(b.sku)));
 
     const recovered = load("collector-recovered.json");
-    assert.equal(evaluateCatalogContract(recovered).valid, true);
+    assert.equal(evaluateContract(recovered, fixtureContract).valid, true);
     assert.deepEqual(normalize(recovered), normalize(load("collector-baseline.json")));
   });
 
@@ -393,7 +611,9 @@ describe("committed Bright Data fixtures", () => {
 
     const decision = classifyRun(
       succeeded(parsed.records, parsed.extractionErrors),
-      evaluateCatalogContract(parsed.records),
+      evaluateContract(parsed.records, fixtureContract),
+      null,
+      fixtureContract,
     );
     assert.equal(decision.classification, "structural_break");
     assert.equal(decision.recommendedAction, "heal");
@@ -410,7 +630,9 @@ describe("committed Bright Data fixtures", () => {
     assert.equal(parsed.records.length, 3);
     const decision = classifyRun(
       succeeded(parsed.records),
-      evaluateCatalogContract(parsed.records),
+      evaluateContract(parsed.records, fixtureContract),
+      null,
+      fixtureContract,
     );
     assert.equal(decision.classification, "healthy");
     assert.equal(decision.recommendedAction, "publish");

@@ -19,11 +19,14 @@ import {
   UnparseableRunOutputError,
 } from "../dist/infrastructure/bright-data/parse-run-output.js";
 import { JsonFileRepository } from "../dist/infrastructure/persistence/json-file-repository.js";
+import { FileTargetRegistry } from "../dist/infrastructure/persistence/target-store.js";
 import { createApplicationServer } from "../dist/presentation/api/server.js";
 import {
   isShowingStaleData,
   renderDashboardPage,
 } from "../dist/presentation/web/dashboard-page.js";
+import { EXPORT_FORMATS } from "../dist/presentation/export/export-records.js";
+import { profileContract } from "../dist/domain/contracts/data-contract.js";
 import { loadConfig } from "../dist/config/config.js";
 import { ConsoleLogger } from "../dist/infrastructure/logging/logger.js";
 import type { CollectorConfig, NormalizedRunResult } from "../dist/domain/contracts/collector-run.js";
@@ -331,6 +334,62 @@ describe("JsonFileRepository", () => {
     }
   });
 
+  it("remembers a learned contract across a restart", async () => {
+    const path = join(directory, "contract.json");
+    const contract = profileContract([
+      { title: "Dune", isbn: "9780441013593", pages: 412 },
+    ]);
+
+    const first = new JsonFileRepository(path);
+    await first.saveContract("c_test", contract);
+
+    const restarted = new JsonFileRepository(path);
+    const loaded = await restarted.getContract("c_test");
+    assert.deepEqual(loaded, contract);
+  });
+
+  it("discards a malformed contract rather than enforcing rules nobody chose", async () => {
+    const { writeFileSync } = await import("node:fs");
+    const shapes = [
+      JSON.stringify({ contracts: { c_test: "nope" } }),
+      JSON.stringify({ contracts: { c_test: { version: "one" } } }),
+      JSON.stringify({ contracts: { c_test: { version: 1, minimumRows: 1.5 } } }),
+      JSON.stringify({ contracts: { c_test: { version: 1, identityField: 42 } } }),
+    ];
+
+    for (const [index, contents] of shapes.entries()) {
+      const path = join(directory, `contract-shape-${String(index)}.json`);
+      writeFileSync(path, contents, "utf8");
+      const repository = new JsonFileRepository(path);
+      assert.equal(await repository.getContract("c_test"), null, contents);
+    }
+  });
+
+  it("keeps data written before contracts existed", async () => {
+    const { writeFileSync } = await import("node:fs");
+    const path = join(directory, "legacy.json");
+    // Version 1 stored rows under "catalog".
+    writeFileSync(
+      path,
+      JSON.stringify({
+        version: 1,
+        catalog: {
+          c_test: {
+            records: [{ name: "n", sku: "S-1" }],
+            collectedAt: "2026-08-01T00:00:00Z",
+          },
+        },
+        events: [],
+      }),
+      "utf8",
+    );
+
+    const repository = new JsonFileRepository(path);
+    const snapshot = await repository.getLastKnownGood("c_test");
+    assert.equal(snapshot?.records.length, 1);
+    assert.equal(await repository.getContract("c_test"), null);
+  });
+
   it("keeps locks in memory so a stale lock cannot outlive the process", async () => {
     const path = join(directory, "locks.json");
     const first = new JsonFileRepository(path);
@@ -343,17 +402,23 @@ describe("JsonFileRepository", () => {
 });
 
 describe("dashboard rendering", () => {
+  const RECORDS = [
+    { name: "Motor", sku: "MTR-100", price: 49.95, availability: "in_stock" },
+  ];
+
   const target = {
     id: "demo",
     label: "Demo target",
     collectorId: "c_test",
     targetUrl: "https://example.test/catalog",
     controllable: true,
-    records: [{ name: "Motor", sku: "MTR-100", price: 49.95, availability: "in_stock" as const }],
+    records: RECORDS,
     collectedAt: new Date().toISOString(),
     events: [],
     busy: false,
     lastError: null,
+    contract: profileContract(RECORDS),
+    provisioning: null,
   };
 
   const page = (state: string, overrides: Record<string, unknown> = {}) =>
@@ -362,6 +427,8 @@ describe("dashboard rendering", () => {
       autoHealEnabled: true,
       geminiEnabled: false,
       scheduleMinutes: null,
+      canAddTargets: true,
+      requiresToken: false,
       targets: [{ ...target, state, ...overrides }],
     } as never);
 
@@ -439,6 +506,8 @@ describe("dashboard rendering", () => {
       autoHealEnabled: true,
       geminiEnabled: false,
       scheduleMinutes: 30,
+      canAddTargets: true,
+      requiresToken: false,
       targets: [
         { ...target, state: "healthy" },
         {
@@ -464,14 +533,100 @@ describe("dashboard rendering", () => {
       autoHealEnabled: false,
       geminiEnabled: false,
       scheduleMinutes: null,
+      canAddTargets: true,
+      requiresToken: false,
       targets: [],
     } as never);
-    assert.ok(empty.includes("No targets configured"));
+    assert.match(empty, /No sites yet/);
     assert.ok(empty.includes("auto-repair off"));
 
     const noData = page("idle", { records: [], collectedAt: null });
     assert.ok(noData.includes("No verified data collected yet"));
     assert.ok(noData.includes("never"));
+  });
+
+  it("builds columns from whatever fields the site returned", () => {
+    const articles = [
+      { headline: "Something happened", byline: "A. Reporter", words: 900 },
+    ];
+    const html = page("healthy", {
+      records: articles,
+      contract: profileContract(articles),
+    });
+    assert.match(html, /<th scope="col">headline<\/th>/);
+    assert.match(html, /<th scope="col">byline<\/th>/);
+    assert.ok(html.includes("A. Reporter"));
+    // Nothing catalog-specific may leak into a site that has no such fields.
+    assert.ok(!html.includes(">sku<"));
+  });
+
+  it("offers a download for every supported format", () => {
+    const html = page("healthy");
+    for (const format of EXPORT_FORMATS) {
+      assert.ok(
+        html.includes(`/api/targets/demo/export?format=${format}`),
+        format,
+      );
+    }
+  });
+
+  it("offers no downloads when there is nothing verified to download", () => {
+    const html = page("idle", { records: [], collectedAt: null });
+    assert.ok(!html.includes("/export?format="));
+  });
+
+  it("shows the learned contract, so the guarantee is visible", () => {
+    const html = page("healthy");
+    assert.match(html, /Learned data contract/);
+    assert.match(html, /Rows are identified by/);
+  });
+
+  it("says so when no contract has been learned yet", () => {
+    const html = page("idle", { records: [], contract: null });
+    assert.match(html, /No contract learned yet/);
+  });
+
+  it("shows a site whose scraper is still being built", () => {
+    const html = page("idle", {
+      records: [],
+      contract: null,
+      provisioning: "Bright Data is building a scraper for this page.",
+    });
+    assert.match(html, /Building scraper/);
+    assert.match(html, /building a scraper/i);
+    // Collecting cannot be requested before the scraper exists.
+    assert.match(html, /<button data-target="demo" disabled>/);
+  });
+
+  it("renders the add-site form when new scrapers can be built", () => {
+    const html = page("healthy");
+    assert.match(html, /id="add-form"/);
+    assert.match(html, /name="url"/);
+    assert.match(html, /name="description"/);
+  });
+
+  it("explains itself instead of offering a form that cannot work", () => {
+    const html = renderDashboardPage({
+      configured: true,
+      autoHealEnabled: false,
+      geminiEnabled: false,
+      scheduleMinutes: null,
+      canAddTargets: false,
+      requiresToken: false,
+      targets: [{ ...target, state: "healthy" }],
+    } as never);
+    assert.ok(!html.includes('id="add-form"'));
+    assert.match(html, /needs the Bright Data CLI/);
+  });
+
+  it("escapes a hostile field name as well as a hostile value", () => {
+    const hostile = [{ "<img src=x onerror=alert(1)>": "value" }];
+    const html = page("healthy", {
+      records: hostile,
+      contract: profileContract(hostile),
+    });
+    assert.ok(!html.includes("<img src=x"));
+    assert.ok(html.includes("&lt;img"));
   });
 });
 
@@ -506,6 +661,11 @@ describe("application server", () => {
       repository,
       runner: { run: () => Promise.resolve(runResult) },
       logger: new ConsoleLogger(),
+      targets: new FileTargetRegistry(
+        config.targets,
+        join(directory, "targets.json"),
+        5000,
+      ),
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -616,6 +776,14 @@ describe("application server", () => {
             }),
         },
         logger: { info: () => undefined, error: () => undefined },
+        targets: new FileTargetRegistry(
+          loadConfig({
+            SUPASCRAPER_COLLECTOR_ID: "c_test",
+            SUPASCRAPER_TARGET_URL: "https://example.test/catalog",
+          }).targets,
+          join(directory, "busy-targets.json"),
+          5000,
+        ),
       },
     );
 
@@ -652,6 +820,296 @@ describe("application server", () => {
     assert.equal(page.status, 200);
     assert.ok((await page.text()).includes("SupaScraper"));
     assert.equal((await fetch(`${base}/nope`)).status, 404);
+  });
+
+  it("lists the monitored targets", async () => {
+    const body = (await (await fetch(`${base}/api/targets`)).json()) as {
+      targets: { id: string; collectorId: string }[];
+      exportFormats: string[];
+    };
+    assert.equal(body.targets[0]?.collectorId, "c_test");
+    assert.deepEqual(body.exportFormats, [...EXPORT_FORMATS]);
+  });
+
+  it("exports verified data in every supported format", async () => {
+    for (const format of EXPORT_FORMATS) {
+      const response = await fetch(
+        `${base}/api/targets/primary/export?format=${format}`,
+      );
+      assert.equal(response.status, 200, format);
+      assert.match(
+        response.headers.get("content-disposition") ?? "",
+        /^attachment; filename="[^"]+"$/,
+        format,
+      );
+      const text = await response.text();
+      assert.ok(text.length > 0, format);
+      assert.ok(text.includes("MTR-100"), format);
+    }
+  });
+
+  it("exports JSON that parses back into the verified rows", async () => {
+    const response = await fetch(`${base}/api/targets/primary/export?format=json`);
+    const rows = (await response.json()) as Record<string, unknown>[];
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.["sku"], "MTR-100");
+  });
+
+  it("exports CSV with a header row and quoted separators", async () => {
+    const text = await (
+      await fetch(`${base}/api/targets/primary/export?format=csv`)
+    ).text();
+    const [header, first] = text.split("\r\n");
+    assert.ok(header?.includes("sku"), header);
+    assert.ok(first?.includes("MTR-100"), first);
+  });
+
+  it("defaults to JSON when no format is given", async () => {
+    const response = await fetch(`${base}/api/targets/primary/export`);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /application\/json/);
+  });
+
+  it("refuses an unsupported export format", async () => {
+    const response = await fetch(`${base}/api/targets/primary/export?format=exe`);
+    assert.equal(response.status, 400);
+    const body = (await response.json()) as { supported: string[] };
+    assert.deepEqual(body.supported, [...EXPORT_FORMATS]);
+  });
+
+  it("returns 404 when exporting a target that does not exist", async () => {
+    const response = await fetch(`${base}/api/targets/nope/export?format=csv`);
+    assert.equal(response.status, 404);
+  });
+
+  it("cannot build new scrapers when no factory is available", async () => {
+    const response = await fetch(`${base}/api/targets`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        url: "https://example.com/products",
+        description: "Extract the product title and price for each item.",
+      }),
+    });
+    assert.equal(response.status, 503);
+  });
+});
+
+describe("adding a site over HTTP", () => {
+  let server: Server;
+  let base: string;
+  let directory: string;
+  let created: { url: string; description: string; name: string }[];
+  let failNext: boolean;
+
+  before(async () => {
+    directory = mkdtempSync(join(tmpdir(), "supascraper-add-"));
+    created = [];
+    failNext = false;
+
+    const config = loadConfig({
+      SUPASCRAPER_DATA_PATH: join(directory, "state.json"),
+    });
+
+    server = createApplicationServer(config, {
+      repository: new JsonFileRepository(config.dataPath),
+      runner: {
+        run: () =>
+          Promise.resolve({
+            collectorId: "c_new",
+            targetUrl: "https://example.com/products",
+            startedAt: "2026-08-22T00:00:00Z",
+            finishedAt: "2026-08-22T00:00:05Z",
+            status: "succeeded" as const,
+            records: [{ title: "Widget", price: 9.99 }],
+            extractionErrors: [],
+            snapshotId: null,
+            safeError: null,
+          }),
+      },
+      logger: { info: () => undefined, error: () => undefined },
+      targets: new FileTargetRegistry([], join(directory, "targets.json"), 5000),
+      factory: {
+        create: (input) => {
+          created.push(input);
+          return failNext
+            ? Promise.reject(new Error("AI generation failed"))
+            : Promise.resolve({ collectorId: "c_new" });
+        },
+      },
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (address === null || typeof address === "string") {
+      throw new Error("expected a TCP address");
+    }
+    base = `http://127.0.0.1:${String(address.port)}`;
+  });
+
+  after(async () => {
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  const add = (body: unknown): Promise<Response> =>
+    fetch(`${base}/api/targets`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+  const waitForTarget = async (id: string): Promise<Record<string, unknown>> => {
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+      const body = (await (await fetch(`${base}/api/status`)).json()) as {
+        targets: Record<string, unknown>[];
+      };
+      const found = body.targets.find((target) => target["id"] === id);
+      if (found !== undefined && found["provisioning"] === null && !found["busy"]) {
+        return found;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`target ${id} never settled`);
+  };
+
+  it("accepts a public page and answers before the scraper is built", async () => {
+    const response = await add({
+      url: "https://example.com/products",
+      description: "For each product card, extract the title and the price as a number.",
+      label: "Example shop",
+    });
+
+    assert.equal(response.status, 202);
+    const body = (await response.json()) as { target: Record<string, unknown> };
+    assert.equal(body.target["status"], "building");
+    assert.equal(body.target["id"], "example-com-products");
+    assert.equal(body.target["label"], "Example shop");
+  });
+
+  it("builds the scraper, collects, and learns a contract without being asked", async () => {
+    const target = await waitForTarget("example-com-products");
+
+    assert.equal(created.length, 1);
+    assert.equal(created[0]?.url, "https://example.com/products");
+    assert.equal(target["collectorId"], "c_new");
+    assert.deepEqual(target["records"], [{ title: "Widget", price: 9.99 }]);
+
+    const contract = target["contract"] as { requiredFields: string[] } | null;
+    assert.ok(contract);
+    assert.deepEqual([...contract.requiredFields].sort(), ["price", "title"]);
+  });
+
+  it("exports the newly added site's data", async () => {
+    const text = await (
+      await fetch(`${base}/api/targets/example-com-products/export?format=csv`)
+    ).text();
+    assert.match(text, /title/);
+    assert.match(text, /Widget/);
+  });
+
+  it("refuses the same page twice", async () => {
+    const response = await add({
+      url: "https://example.com/products",
+      description: "For each product card, extract the title and the price as a number.",
+    });
+    assert.equal(response.status, 400);
+    const body = (await response.json()) as { error: string };
+    assert.match(body.error, /already being monitored/);
+  });
+
+  it("rejects input that could not produce a working scraper", async () => {
+    const cases: [unknown, RegExp][] = [
+      [{ url: "", description: "Extract the title and price of each item." }, /required/],
+      [{ url: "not-a-url", description: "Extract the title and price of each item." }, /valid URL/],
+      [{ url: "http://example.org/x", description: "Extract the title and price." }, /https/],
+      [{ url: "https://example.org/x", description: "too short" }, /at least/],
+      [{ url: "https://example.org/x", description: "y".repeat(501) }, /at most/],
+    ];
+
+    for (const [body, expected] of cases) {
+      const response = await add(body);
+      assert.equal(response.status, 400, JSON.stringify(body));
+      const parsed = (await response.json()) as { error: string };
+      assert.match(parsed.error, expected);
+    }
+  });
+
+  it("refuses an address that is not a public website", async () => {
+    const privateUrls = [
+      "https://localhost/x",
+      "https://127.0.0.1/x",
+      "https://10.1.2.3/x",
+      "https://192.168.0.5/x",
+      "https://172.16.4.4/x",
+      "https://169.254.169.254/latest/meta-data",
+      "https://metadata.google.internal/x",
+      "https://[::1]/x",
+      "https://box.internal/x",
+    ];
+
+    for (const url of privateUrls) {
+      const response = await add({
+        url,
+        description: "Extract the title and price of each item on the page.",
+      });
+      assert.equal(response.status, 400, url);
+      const parsed = (await response.json()) as { error: string };
+      assert.match(parsed.error, /public/i, url);
+    }
+  });
+
+  it("refuses credentials embedded in the URL", async () => {
+    const response = await add({
+      url: "https://user:secret@example.org/x",
+      description: "Extract the title and price of each item on the page.",
+    });
+    assert.equal(response.status, 400);
+    const parsed = (await response.json()) as { error: string };
+    assert.match(parsed.error, /credentials/i);
+  });
+
+  it("refuses an oversized request body", async () => {
+    const response = await add({
+      url: "https://example.org/x",
+      description: "d".repeat(20_000),
+    });
+    assert.equal(response.status, 400);
+  });
+
+  it("refuses a body that is not JSON", async () => {
+    const response = await fetch(`${base}/api/targets`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{{{",
+    });
+    assert.equal(response.status, 400);
+  });
+
+  it("records a build failure against the site instead of losing it", async () => {
+    failNext = true;
+    const response = await add({
+      url: "https://example.net/catalogue",
+      description: "Extract each listing's name and price from the catalogue page.",
+    });
+    assert.equal(response.status, 202);
+
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+      const body = (await (await fetch(`${base}/api/status`)).json()) as {
+        targets: Record<string, unknown>[];
+      };
+      const found = body.targets.find((t) => t["id"] === "example-net-catalogue");
+      if (found?.["lastError"] === "AI generation failed") {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("the failure was never reported");
   });
 });
 

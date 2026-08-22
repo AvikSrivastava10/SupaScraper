@@ -16,7 +16,10 @@ import {
   startScheduler,
 } from "../dist/application/schedule/scheduler.js";
 import { shouldConsultReasoner } from "../dist/application/process-run/process-run.js";
-import { evaluateCatalogContract } from "../dist/domain/contracts/catalog-contract.js";
+import {
+  evaluateContract,
+  profileContract,
+} from "../dist/domain/contracts/data-contract.js";
 import { loadConfig } from "../dist/config/config.js";
 import type { DetectionDecision } from "../dist/domain/detection/classify-run.js";
 import type { NormalizedRunResult } from "../dist/domain/contracts/collector-run.js";
@@ -43,10 +46,12 @@ const STRUCTURAL: DetectionDecision = {
   recommendedAction: "heal",
 };
 
+const CONTRACT = profileContract(RUN.records as Record<string, unknown>[]);
+
 const context = (): ReasoningContext => ({
   fieldDescription: "name, sku, price, availability",
   run: RUN,
-  evaluation: evaluateCatalogContract(RUN.records),
+  evaluation: evaluateContract(RUN.records, CONTRACT),
   deterministic: STRUCTURAL,
 });
 
@@ -80,7 +85,7 @@ describe("buildReasoningPayload", () => {
     const payload = buildReasoningPayload({
       ...context(),
       run: { ...RUN, records: many },
-      evaluation: evaluateCatalogContract(many),
+      evaluation: evaluateContract(many, CONTRACT),
     });
     assert.equal((payload["sampleRows"] as unknown[]).length, 3);
   });

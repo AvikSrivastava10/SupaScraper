@@ -5,8 +5,10 @@ import {
   ContractPreviewReviewer,
   healAndVerify,
   type HealAndVerifyDependencies,
+  type HealAndVerifyInput,
   type HealEnvelope,
 } from "../dist/application/heal-and-verify/heal-and-verify.js";
+import { profileContract } from "../dist/domain/contracts/data-contract.js";
 import type {
   CollectorConfig,
   NormalizedRunResult,
@@ -17,6 +19,9 @@ const VALID = [
   { name: "Precision Stepper Motor", sku: "MTR-100", price: 49.95, availability: "in_stock" },
 ];
 const BROKEN = [{ name: "Precision Stepper Motor", sku: "MTR-100", availability: "in_stock" }];
+
+/** The contract this collector had already been holding to. */
+const CONTRACT = profileContract(VALID);
 
 const config: CollectorConfig = {
   collectorId: "c_test",
@@ -32,6 +37,14 @@ const structuralBreak: DetectionDecision = {
   source: "deterministic",
   recommendedAction: "heal",
 };
+
+const input = (overrides: Partial<HealAndVerifyInput> = {}): HealAndVerifyInput => ({
+  config,
+  decision: structuralBreak,
+  healPrompt: "p",
+  contract: CONTRACT,
+  ...overrides,
+});
 
 const run = (
   records: readonly unknown[],
@@ -106,6 +119,8 @@ function harness(options: {
         return Promise.resolve();
       },
       getLastKnownGood: () => Promise.resolve(null),
+      getContract: () => Promise.resolve(CONTRACT),
+      saveContract: () => Promise.resolve(),
     },
     lock: {
       acquire: () => Promise.resolve(options.lockAvailable === false ? null : "token"),
@@ -124,7 +139,7 @@ describe("healAndVerify entry policy", () => {
     for (const classification of ["healthy", "legitimate_change", "transient_error", "ambiguous"] as const) {
       await assert.rejects(
         healAndVerify(
-          { config, decision: { ...structuralBreak, classification }, healPrompt: "p" },
+          input({ decision: { ...structuralBreak, classification } }),
           dependencies,
         ),
         /Only a confirmed structural break/,
@@ -136,7 +151,7 @@ describe("healAndVerify entry policy", () => {
     const { dependencies } = harness({});
     await assert.rejects(
       healAndVerify(
-        { config, decision: { ...structuralBreak, recommendedAction: "manual_review" }, healPrompt: "p" },
+        input({ decision: { ...structuralBreak, recommendedAction: "manual_review" } }),
         dependencies,
       ),
       /Only a confirmed structural break/,
@@ -147,17 +162,14 @@ describe("healAndVerify entry policy", () => {
 describe("healAndVerify locking", () => {
   it("reports already in progress without healing when the lock is held", async () => {
     const { calls, dependencies } = harness({ lockAvailable: false });
-    const outcome = await healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies);
+    const outcome = await healAndVerify(input(), dependencies);
     assert.equal(outcome.status, "already_in_progress");
     assert.equal(calls.heal, 0);
   });
 
   it("releases the lock even when the healer throws, without masking the error", async () => {
     const { calls, dependencies } = harness({ healThrows: true });
-    await assert.rejects(
-      healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies),
-      /healer exploded/,
-    );
+    await assert.rejects(healAndVerify(input(), dependencies), /healer exploded/);
     assert.equal(calls.release, 1);
   });
 
@@ -170,17 +182,14 @@ describe("healAndVerify locking", () => {
         release: () => Promise.reject(new Error("release blew up")),
       },
     };
-    await assert.rejects(
-      healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, failing),
-      /healer exploded/,
-    );
+    await assert.rejects(healAndVerify(input(), failing), /healer exploded/);
   });
 });
 
 describe("healAndVerify approval gate", () => {
   it("enters manual review when the heal never reaches the gate", async () => {
     const { calls, dependencies } = harness({ healEnvelope: envelope("failed", null) });
-    const outcome = await healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies);
+    const outcome = await healAndVerify(input(), dependencies);
     assert.equal(outcome.status, "manual_review");
     assert.equal(calls.approve, 0);
     assert.equal(calls.run, 0);
@@ -189,14 +198,14 @@ describe("healAndVerify approval gate", () => {
 
   it("recognizes the real awaiting_approval status returned by the CLI", async () => {
     const { calls, dependencies } = harness({ healEnvelope: envelope("awaiting_approval", VALID) });
-    const outcome = await healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies);
+    const outcome = await healAndVerify(input(), dependencies);
     assert.equal(outcome.status, "recovered");
     assert.equal(calls.approve, 1);
   });
 
   it("rejects an implausible preview and never approves it", async () => {
     const { calls, dependencies } = harness({ healEnvelope: envelope("awaiting_approval", BROKEN) });
-    const outcome = await healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies);
+    const outcome = await healAndVerify(input(), dependencies);
     assert.equal(outcome.status, "manual_review");
     assert.equal(calls.reject, 1);
     assert.equal(calls.approve, 0);
@@ -204,10 +213,20 @@ describe("healAndVerify approval gate", () => {
     assert.equal(calls.publish, 0);
   });
 
-  it("rejects a preview that parses but violates a domain rule", async () => {
-    const negative = [{ ...VALID[0], price: -5 }];
-    const { calls, dependencies } = harness({ healEnvelope: envelope("awaiting_approval", negative) });
-    const outcome = await healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies);
+  it("rejects a preview whose field types no longer match the contract", async () => {
+    const retyped = [{ ...VALID[0], price: "£49.95" }];
+    const { calls, dependencies } = harness({ healEnvelope: envelope("awaiting_approval", retyped) });
+    const outcome = await healAndVerify(input(), dependencies);
+    assert.equal(outcome.status, "manual_review");
+    assert.equal(calls.reject, 1);
+  });
+
+  it("rejects a preview that returns the same row repeatedly", async () => {
+    const duplicated = [VALID[0], VALID[0]];
+    const { calls, dependencies } = harness({
+      healEnvelope: envelope("awaiting_approval", duplicated),
+    });
+    const outcome = await healAndVerify(input(), dependencies);
     assert.equal(outcome.status, "manual_review");
     assert.equal(calls.reject, 1);
   });
@@ -215,7 +234,7 @@ describe("healAndVerify approval gate", () => {
   it("rejects a preview that is not a record array", async () => {
     for (const preview of [null, "rows", 42, { rows: VALID }]) {
       const { calls, dependencies } = harness({ healEnvelope: envelope("awaiting_approval", preview) });
-      const outcome = await healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies);
+      const outcome = await healAndVerify(input(), dependencies);
       assert.equal(outcome.status, "manual_review");
       assert.equal(calls.approve, 0);
     }
@@ -225,7 +244,7 @@ describe("healAndVerify approval gate", () => {
 describe("healAndVerify verification", () => {
   it("does not report recovery when the rerun is still invalid", async () => {
     const { calls, dependencies } = harness({ verificationRun: run(BROKEN) });
-    const outcome = await healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies);
+    const outcome = await healAndVerify(input(), dependencies);
     assert.equal(outcome.status, "manual_review");
     assert.equal(calls.publish, 0);
   });
@@ -234,7 +253,7 @@ describe("healAndVerify verification", () => {
     const { calls, dependencies } = harness({
       verificationRun: run(VALID, { collectorId: "c_other" }),
     });
-    const outcome = await healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies);
+    const outcome = await healAndVerify(input(), dependencies);
     assert.equal(outcome.status, "manual_review");
     assert.equal(calls.publish, 0);
     assert.match(outcome.reason, /same collector/);
@@ -244,7 +263,7 @@ describe("healAndVerify verification", () => {
     const { calls, dependencies } = harness({
       verificationRun: run(VALID, { targetUrl: "https://elsewhere.test/catalog" }),
     });
-    const outcome = await healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies);
+    const outcome = await healAndVerify(input(), dependencies);
     assert.equal(outcome.status, "manual_review");
     assert.equal(calls.publish, 0);
   });
@@ -252,7 +271,7 @@ describe("healAndVerify verification", () => {
   it("does not report recovery when the verification run fails or times out", async () => {
     for (const status of ["failed", "timed_out"] as const) {
       const { calls, dependencies } = harness({ verificationRun: run([], { status }) });
-      const outcome = await healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies);
+      const outcome = await healAndVerify(input(), dependencies);
       assert.equal(outcome.status, "manual_review");
       assert.equal(calls.publish, 0);
     }
@@ -260,7 +279,7 @@ describe("healAndVerify verification", () => {
 
   it("publishes and ends in recovered only on full success", async () => {
     const { calls, dependencies } = harness({});
-    const outcome = await healAndVerify({ config, decision: structuralBreak, healPrompt: "p" }, dependencies);
+    const outcome = await healAndVerify(input(), dependencies);
     assert.equal(outcome.status, "recovered");
     assert.equal(outcome.finalState, "recovered");
     assert.equal(calls.publish, 1);
@@ -281,14 +300,27 @@ describe("ContractPreviewReviewer", () => {
         product_page_url: "https://example.test/product/MTR-100",
       },
     ]);
-    const review = new ContractPreviewReviewer().review(real);
+    const review = new ContractPreviewReviewer().review(real, CONTRACT);
     assert.equal(review.plausible, true);
     assert.ok(review.evidence.length > 0);
   });
 
   it("explains why a preview was rejected", () => {
-    const review = new ContractPreviewReviewer().review(envelope("awaiting_approval", BROKEN));
+    const review = new ContractPreviewReviewer().review(
+      envelope("awaiting_approval", BROKEN),
+      CONTRACT,
+    );
     assert.equal(review.plausible, false);
     assert.ok(review.evidence.some((line) => line.includes("price")));
+  });
+
+  it("judges a preview against whatever contract the site actually has", () => {
+    // The same preview is fine for a site whose contract never included a price.
+    const priceless = profileContract(BROKEN);
+    const review = new ContractPreviewReviewer().review(
+      envelope("awaiting_approval", BROKEN),
+      priceless,
+    );
+    assert.equal(review.plausible, true);
   });
 });

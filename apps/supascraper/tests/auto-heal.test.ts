@@ -12,7 +12,11 @@ import {
   type HealEnvelope,
 } from "../dist/application/heal-and-verify/heal-and-verify.js";
 import { buildHealPrompt, MAX_HEAL_PROMPT_LENGTH } from "../dist/domain/repair/heal-prompt.js";
-import { evaluateCatalogContract } from "../dist/domain/contracts/catalog-contract.js";
+import {
+  evaluateContract,
+  profileContract,
+  type DataContract,
+} from "../dist/domain/contracts/data-contract.js";
 import type {
   CollectorConfig,
   NormalizedRunResult,
@@ -22,6 +26,11 @@ import type { RepairEvent } from "../dist/domain/repair/repair-event.js";
 const VALID = [
   { name: "Precision Stepper Motor", sku: "MTR-100", price: 49.95, availability: "in_stock" },
 ];
+
+/** What a site that has already run successfully would be held to. */
+const CONTRACT = profileContract(VALID);
+
+const evaluate = (records: readonly unknown[]) => evaluateContract(records, CONTRACT);
 
 const CONFIG: CollectorConfig = {
   collectorId: "c_test",
@@ -67,10 +76,13 @@ const envelope = (status: string, previewResult: unknown): HealEnvelope => ({
 interface Recorder {
   readonly events: RepairEvent[];
   readonly published: { records: readonly unknown[]; at: string }[];
+  readonly savedContracts: DataContract[];
   readonly calls: { heal: number; approve: number; reject: number; verify: number };
   readonly store: {
     saveLastKnownGood: (id: string, records: readonly never[], at: string) => Promise<void>;
     getLastKnownGood: () => Promise<{ records: readonly never[] } | null>;
+    getContract: () => Promise<DataContract | null>;
+    saveContract: (id: string, contract: DataContract) => Promise<void>;
     appendEvent: (event: RepairEvent) => Promise<void>;
   };
   readonly repair: HealAndVerifyDependencies;
@@ -80,12 +92,17 @@ function recorder(options: {
   healEnvelope?: HealEnvelope;
   verificationRecords?: readonly unknown[];
   baseline?: readonly unknown[];
+  /** Null models a site that has never produced a good run. */
+  contract?: DataContract | null;
 } = {}): Recorder {
   const events: RepairEvent[] = [];
   const published: { records: readonly unknown[]; at: string }[] = [];
+  const savedContracts: DataContract[] = [];
   const calls = { heal: 0, approve: 0, reject: 0, verify: 0 };
 
   let baseline: readonly unknown[] | null = options.baseline ?? null;
+  let contract: DataContract | null =
+    options.contract === undefined ? CONTRACT : options.contract;
 
   const store = {
     saveLastKnownGood: (_id: string, records: readonly never[], at: string) => {
@@ -95,6 +112,12 @@ function recorder(options: {
     },
     getLastKnownGood: () =>
       Promise.resolve(baseline === null ? null : { records: baseline as never[] }),
+    getContract: () => Promise.resolve(contract),
+    saveContract: (_id: string, next: DataContract) => {
+      contract = next;
+      savedContracts.push(next);
+      return Promise.resolve();
+    },
     appendEvent: (event: RepairEvent) => {
       events.push(event);
       return Promise.resolve();
@@ -132,7 +155,7 @@ function recorder(options: {
     },
   };
 
-  return { events, published, calls, store, repair };
+  return { events, published, savedContracts, calls, store, repair };
 }
 
 describe("buildHealPrompt", () => {
@@ -141,7 +164,7 @@ describe("buildHealPrompt", () => {
     const prompt = buildHealPrompt({
       fieldDescription: CONFIG.fieldDescription,
       run: broken,
-      evaluation: evaluateCatalogContract(broken.records),
+      evaluation: evaluate(broken.records),
     });
     assert.match(prompt, /span\[data-field=title\]/);
     assert.match(prompt, /restructured/);
@@ -153,14 +176,25 @@ describe("buildHealPrompt", () => {
     const prompt = buildHealPrompt({
       fieldDescription: CONFIG.fieldDescription,
       run: broken,
-      evaluation: evaluateCatalogContract(broken.records),
+      evaluation: evaluate(broken.records),
     });
     assert.doesNotMatch(prompt, /\.[a-z-]+\s*\{|span\[|div\.|css/i);
     assert.match(prompt, /price/);
   });
 
+  it("names the fields that failed, whatever they are called", () => {
+    const contract = profileContract([{ headline: "a", byline: "b" }]);
+    const broken = run({ records: [{ headline: "", byline: "b" }] });
+    const prompt = buildHealPrompt({
+      fieldDescription: "Extract the headline and byline of each article.",
+      run: broken,
+      evaluation: evaluateContract(broken.records, contract),
+    });
+    assert.match(prompt, /headline/);
+  });
+
   it("stays within the verified prompt limit even with long evidence", () => {
-    const many = Array.from({ length: 60 }, (_, index) => ({
+    const many = Array.from({ length: 60 }, (_unused, index) => ({
       name: "",
       sku: "",
       price: -1,
@@ -170,9 +204,70 @@ describe("buildHealPrompt", () => {
     const prompt = buildHealPrompt({
       fieldDescription: "x".repeat(900),
       run: broken,
-      evaluation: evaluateCatalogContract(broken.records),
+      evaluation: evaluate(broken.records),
     });
     assert.ok(prompt.length <= MAX_HEAL_PROMPT_LENGTH, `length was ${String(prompt.length)}`);
+  });
+});
+
+describe("contract learning", () => {
+  it("learns a contract from the first good run and stores it", async () => {
+    const harness = recorder({ contract: null });
+    const result = await processCollectorRun(run(), harness.store, harness.store, {});
+
+    assert.equal(result.published, true);
+    assert.equal(result.contractLearned, true);
+    assert.equal(harness.savedContracts.length, 1);
+    assert.equal(result.contract.identityField, "sku");
+    assert.ok(result.contract.requiredFields.includes("price"));
+  });
+
+  it("does not relearn a contract once one exists", async () => {
+    const harness = recorder();
+    const result = await processCollectorRun(run(), harness.store, harness.store, {});
+
+    assert.equal(result.contractLearned, false);
+    assert.equal(harness.savedContracts.length, 0);
+  });
+
+  it("never learns from a run it refused to publish", async () => {
+    const harness = recorder({ contract: null });
+    const empty = run({ records: [] });
+    const result = await processCollectorRun(empty, harness.store, harness.store, {});
+
+    assert.equal(result.published, false);
+    assert.equal(result.contractLearned, false);
+    assert.equal(harness.savedContracts.length, 0);
+  });
+
+  it("holds later runs to the contract it learned", async () => {
+    const harness = recorder({ contract: null });
+    await processCollectorRun(run(), harness.store, harness.store, {});
+
+    // Same site, but the price is no longer being extracted.
+    const degraded = run({
+      records: [{ name: "Precision Stepper Motor", sku: "MTR-100", availability: "in_stock" }],
+    });
+    const second = await processCollectorRun(degraded, harness.store, harness.store, {});
+
+    assert.equal(second.decision.classification, "structural_break");
+    assert.equal(second.published, false);
+    assert.equal(harness.published.length, 1, "only the first run may have published");
+  });
+
+  it("accepts an arbitrary shape on a site it has never seen", async () => {
+    const harness = recorder({ contract: null });
+    const articles = run({
+      records: [
+        { headline: "First", url: "https://news.test/1" },
+        { headline: "Second", url: "https://news.test/2" },
+      ],
+    });
+    const result = await processCollectorRun(articles, harness.store, harness.store, {});
+
+    assert.equal(result.published, true);
+    assert.equal(result.contractLearned, true);
+    assert.deepEqual([...result.contract.requiredFields].sort(), ["headline", "url"]);
   });
 });
 
@@ -398,16 +493,28 @@ describe("post-heal baseline continuity", () => {
     { name: "Compact Control Relay", sku: "RLY-310", price: 29.75, availability: "out_of_stock" },
   ];
 
-  it("computes overlap against previously known products", () => {
-    assert.equal(baselineOverlap(BASELINE, BASELINE), 1);
-    assert.equal(baselineOverlap(BASELINE, BASELINE.slice(0, 2)), 2 / 3);
-    assert.equal(baselineOverlap(BASELINE, []), 0);
-    assert.equal(baselineOverlap([], BASELINE), 1, "no baseline means nothing to contradict");
+  it("computes overlap against previously known rows", () => {
+    assert.equal(baselineOverlap(BASELINE, BASELINE, CONTRACT), 1);
+    assert.equal(baselineOverlap(BASELINE, BASELINE.slice(0, 2), CONTRACT), 2 / 3);
+    assert.equal(baselineOverlap(BASELINE, [], CONTRACT), 0);
+    assert.equal(
+      baselineOverlap([], BASELINE, CONTRACT),
+      1,
+      "no baseline means nothing to contradict",
+    );
   });
 
-  it("refuses a repair that returns contract-valid data for the wrong products", async () => {
+  it("matches whole rows when the contract has no identity field", () => {
+    const rows = [{ tag: "a" }, { tag: "a" }];
+    const noIdentity = profileContract(rows);
+    assert.equal(noIdentity.identityField, null);
+    assert.equal(baselineOverlap(rows, [{ tag: "a" }], noIdentity), 1);
+    assert.equal(baselineOverlap(rows, [{ tag: "b" }], noIdentity), 0);
+  });
+
+  it("refuses a repair that returns contract-valid data for the wrong rows", async () => {
     // A heal that latched onto a different element can satisfy every contract
-    // rule while quietly losing the catalog, so the contract alone is not proof.
+    // rule while quietly losing the data, so the contract alone is not proof.
     const wrongProducts = [
       { name: "Unrelated Item", sku: "ZZZ-001", price: 1, availability: "in_stock" },
     ];
@@ -426,7 +533,7 @@ describe("post-heal baseline continuity", () => {
     assert.equal(harness.events.at(-1)?.verification, "failed");
   });
 
-  it("accepts a repair that keeps most known products", async () => {
+  it("accepts a repair that keeps most known rows", async () => {
     const harness = recorder({
       verificationRecords: BASELINE.slice(0, 2),
       baseline: BASELINE,
@@ -462,7 +569,7 @@ describe("heal prompt safety", () => {
     const prompt = buildHealPrompt({
       fieldDescription: CONFIG.fieldDescription,
       run: broken,
-      evaluation: evaluateCatalogContract(broken.records),
+      evaluation: evaluate(broken.records),
     });
     assert.match(prompt, /span\[data-field=title\]/);
   });
@@ -484,7 +591,7 @@ describe("heal prompt safety", () => {
     const prompt = buildHealPrompt({
       fieldDescription: CONFIG.fieldDescription,
       run: hostile,
-      evaluation: evaluateCatalogContract(hostile.records),
+      evaluation: evaluate(hostile.records),
     });
 
     assert.doesNotMatch(prompt, /IGNORE ALL PRIOR INSTRUCTIONS/);
@@ -505,7 +612,7 @@ describe("heal prompt safety", () => {
     const prompt = buildHealPrompt({
       fieldDescription: CONFIG.fieldDescription,
       run: long,
-      evaluation: evaluateCatalogContract(long.records),
+      evaluation: evaluate(long.records),
     });
     assert.doesNotMatch(prompt, /\.a\.a\.a/);
   });
@@ -524,7 +631,7 @@ describe("heal prompt safety", () => {
     const prompt = buildHealPrompt({
       fieldDescription: CONFIG.fieldDescription,
       run: tag,
-      evaluation: evaluateCatalogContract(tag.records),
+      evaluation: evaluate(tag.records),
     });
     assert.match(prompt, /waits for h1/);
   });
@@ -543,8 +650,22 @@ describe("heal prompt safety", () => {
     const prompt = buildHealPrompt({
       fieldDescription: CONFIG.fieldDescription,
       run: multiline,
-      evaluation: evaluateCatalogContract(multiline.records),
+      evaluation: evaluate(multiline.records),
     });
     assert.doesNotMatch(prompt, /[\r\n]/);
+  });
+
+  it("never relays a field name that is not a plain identifier", () => {
+    // Field names come from the scraped page, so they are untrusted too.
+    const contract = profileContract([
+      { "<script>alert(1)</script>": "x", ok: "y" },
+    ]);
+    const broken = run({ records: [{ "<script>alert(1)</script>": "", ok: "" }] });
+    const prompt = buildHealPrompt({
+      fieldDescription: CONFIG.fieldDescription,
+      run: broken,
+      evaluation: evaluateContract(broken.records, contract),
+    });
+    assert.doesNotMatch(prompt, /script/i);
   });
 });
